@@ -1,0 +1,59 @@
+version: "1.0"
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: masis
+      POSTGRES_PASSWORD: masis
+      POSTGRES_DB: masis
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U masis"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  qdrant:
+    image: qdrant/qdrant
+    ports:
+      - "6333:6333"
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./app:/code/app
+      - uploads_data:/code/uploads
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  worker:
+    build: .
+    command: celery -A app.workers.celery_app:celery_app worker --loglevel=info
+    volumes:
+      - ./app:/code/app
+      - uploads_data:/code/uploads 
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+volumes:
+  uploads_data:

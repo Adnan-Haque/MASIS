@@ -1,0 +1,160 @@
+<?xml version='1.0' encoding='utf-8'?>
+<FinancialReport company="Apex Financial Corp" fiscalYear="2024">
+  <Summary>
+    <Totalrevenueusdmillions>199.6</Totalrevenueusdmillions>
+    <Netprofitusdmillions>42.8</Netprofitusdmillions>
+    <Profitmarginpct>21.4</Profitmarginpct>
+    <Yoygrowthpct>18.3</Yoygrowthpct>
+    <Totalemployees>2847</Totalemployees>
+    <Headcountgrowthpct>12.1</Headcountgrowthpct>
+  </Summary>
+  <QuarterlyPerformance>
+    <Quarter id="Q1">
+      <Revenue_M>42.1</Revenue_M>
+      <Profit_M>8.3</Profit_M>
+      <Margin_Pct>19.7</Margin_Pct>
+    </Quarter>
+    <Quarter id="Q2">
+      <Revenue_M>47.3</Revenue_M>
+      <Profit_M>9.7</Profit_M>
+      <Margin_Pct>20.5</Margin_Pct>
+    </Quarter>
+    <Quarter id="Q3">
+      <Revenue_M>51.8</Revenue_M>
+      <Profit_M>11.2</Profit_M>
+      <Margin_Pct>21.6</Margin_Pct>
+    </Quarter>
+    <Quarter id="Q4">
+      <Revenue_M>58.4</Revenue_M>
+      <Profit_M>13.6</Profit_M>
+      <Margin_Pct>23.3</Margin_Pct>
+    </Quarter>
+  </QuarterlyPerformance>
+  <AssetAllocation>
+    <Asset name="Cash">
+      <Value_M>120</Value_M>
+      <Percentage>9.6</Percentage>
+    </Asset>
+    <Asset name="Bonds">
+      <Value_M>340</Value_M>
+      <Percentage>27.3</Percentage>
+    </Asset>
+    <Asset name="Equities">
+      <Value_M>520</Value_M>
+      <Percentage>41.8</Percentage>
+    </Asset>
+    <Asset name="Real Estate">
+      <Value_M>180</Value_M>
+      <Percentage>14.5</Percentage>
+    </Asset>
+    <Asset name="Commodities">
+      <Value_M>85</Value_M>
+      <Percentage>6.8</Percentage>
+    </Asset>
+  </AssetAllocation>
+  <Transactions>
+    <Transaction id="TXN001">
+      <Date>2024-01-15</Date>
+      <Type>Revenue</Type>
+      <Amount>3200000</Amount>
+      <Category>Consulting</Category>
+      <Client>TechCorp</Client>
+      <Status>Settled</Status>
+    </Transaction>
+    <Transaction id="TXN002">
+      <Date>2024-02-08</Date>
+      <Type>Expense</Type>
+      <Amount>850000</Amount>
+      <Category>Payroll</Category>
+      <Client>Internal</Client>
+      <Status>Settled</Status>
+    </Transaction>
+    <Transaction id="TXN003">
+      <Date>2024-03-22</Date>
+      <Type>Revenue</Type>
+      <Amount>5100000</Amount>
+      <Category>Software License</Category>
+      <Client>Globex</Client>
+      <Status>Settled</Status>
+    </Transaction>
+    <Transaction id="TXN004">
+      <Date>2024-04-11</Date>
+      <Type>Investment</Type>
+      <Amount>2000000</Amount>
+      <Category>Equipment</Category>
+      <Client>Internal</Client>
+      <Status>Cleared</Status>
+    </Transaction>
+    <Transaction id="TXN005">
+      <Date>2024-05-30</Date>
+      <Type>Revenue</Type>
+      <Amount>4750000</Amount>
+      <Category>Consulting</Category>
+      <Client>Initech</Client>
+      <Status>Settled</Status>
+    </Transaction>
+    <Transaction id="TXN006">
+      <Date>2024-06-17</Date>
+      <Type>Expense</Type>
+      <Amount>1200000</Amount>
+      <Category>Marketing</Category>
+      <Client>AdAgency</Client>
+      <Status>Pending</Status>
+    </Transaction>
+    <Transaction id="TXN007">
+      <Date>2024-07-04</Date>
+      <Type>Revenue</Type>
+      <Amount>6300000</Amount>
+      <Category>SaaS</Category>
+      <Client>MegaCorp</Client>
+      <Status>Settled</Status>
+    </Transaction>
+    <Transaction id="TXN008">
+      <Date>2024-08-21</Date>
+      <Type>Expense</Type>
+      <Amount>975000</Amount>
+      <Category>R&amp;D</Category>
+      <Client>Internal</Client>
+      <Status>Settled</Status>
+    </Transaction>
+    <Transaction id="TXN009">
+      <Date>2024-09-14</Date>
+      <Type>Revenue</Type>
+      <Amount>7800000</Amount>
+      <Category>Consulting</Category>
+      <Client>StartupXYZ</Client>
+      <Status>Settled</Status>
+    </Transaction>
+    <Transaction id="TXN010">
+      <Date>2024-10-03</Date>
+      <Type>Investment</Type>
+      <Amount>3500000</Amount>
+      <Category>Acquisition</Category>
+      <Client>DataFirm</Client>
+      <Status>Cleared</Status>
+    </Transaction>
+    <Transaction id="TXN011">
+      <Date>2024-11-19</Date>
+      <Type>Revenue</Type>
+      <Amount>8900000</Amount>
+      <Category>Software License</Category>
+      <Client>EduGroup</Client>
+      <Status>Settled</Status>
+    </Transaction>
+    <Transaction id="TXN012">
+      <Date>2024-12-31</Date>
+      <Type>Expense</Type>
+      <Amount>1450000</Amount>
+      <Category>Bonus Payout</Category>
+      <Client>Internal</Client>
+      <Status>Pending</Status>
+    </Transaction>
+  </Transactions>
+  <RiskMetrics>
+    <Var95Pct>2.4</Var95Pct>
+    <Sharperatio>1.87</Sharperatio>
+    <Beta>0.92</Beta>
+    <Volatilityannualizedpct>14.3</Volatilityannualizedpct>
+    <Maxdrawdownpct>-8.2</Maxdrawdownpct>
+  </RiskMetrics>
+</FinancialReport>
