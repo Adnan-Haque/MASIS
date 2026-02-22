@@ -5,13 +5,18 @@ import axios from "axios"
 
 function App() {
   const [workspaces, setWorkspaces] = useState<string[]>([])
-  const [selectedWorkspace, setSelectedWorkspace] =
-    useState<string>("")
+  const [selectedWorkspace, setSelectedWorkspace] = useState<string>("")
   const [documents, setDocuments] = useState<Document[]>([])
   const [files, setFiles] = useState<FileList | null>(null)
   const [newWorkspace, setNewWorkspace] = useState("")
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  // 🔥 MASIS STATE
+  const [query, setQuery] = useState("")
+  const [masisResult, setMasisResult] = useState<any>(null)
+  const [masisLoading, setMasisLoading] = useState(false)
+  const [masisError, setMasisError] = useState<string | null>(null)
 
   // ================= FETCH WORKSPACES =================
 
@@ -19,7 +24,6 @@ function App() {
     try {
       const res = await api.get("/workspaces")
       setWorkspaces(res.data)
-
       if (!selectedWorkspace && res.data.length > 0) {
         setSelectedWorkspace(res.data[0])
       }
@@ -28,20 +32,14 @@ function App() {
     }
   }
 
-  // ================= FETCH DOCUMENTS =================
-
   const fetchDocuments = async (workspace: string) => {
     try {
-      const res = await api.get(
-        `/workspaces/${workspace}/documents`
-      )
+      const res = await api.get(`/workspaces/${workspace}/documents`)
       setDocuments(res.data)
     } catch {
       setError("Failed to load documents")
     }
   }
-
-  // ================= CREATE WORKSPACE =================
 
   const handleCreateWorkspace = async () => {
     if (!newWorkspace.trim()) {
@@ -66,8 +64,6 @@ function App() {
     }
   }
 
-  // ================= DELETE WORKSPACE =================
-
   const handleDeleteWorkspace = async () => {
     try {
       await api.delete(`/workspaces/${selectedWorkspace}`)
@@ -78,8 +74,6 @@ function App() {
       setError("Failed to delete workspace")
     }
   }
-
-  // ================= DELETE DOCUMENT =================
 
   const handleDeleteDocument = async (docId: string) => {
     try {
@@ -92,11 +86,8 @@ function App() {
     }
   }
 
-  // ================= UPLOAD =================
-
   const handleUpload = async () => {
     if (!files || !selectedWorkspace) return
-
     setLoading(true)
     setError(null)
 
@@ -125,7 +116,28 @@ function App() {
     setLoading(false)
   }
 
-  // ================= SMART POLLING =================
+  const handleMasisQuery = async () => {
+    if (!selectedWorkspace || !query.trim()) {
+      setMasisError("Enter a query and select a workspace")
+      return
+    }
+
+    setMasisLoading(true)
+    setMasisError(null)
+    setMasisResult(null)
+
+    try {
+      const res = await api.post(
+        `/masis/workspaces/${selectedWorkspace}`,
+        { query }
+      )
+      setMasisResult(res.data)
+    } catch {
+      setMasisError("MASIS query failed")
+    }
+
+    setMasisLoading(false)
+  }
 
   const anyProcessing = documents.some(
     (d) => d.status === "PROCESSING"
@@ -133,11 +145,9 @@ function App() {
 
   useEffect(() => {
     if (!selectedWorkspace) return
-
     fetchDocuments(selectedWorkspace)
 
     if (!anyProcessing) return
-
     const interval = setInterval(() => {
       fetchDocuments(selectedWorkspace)
     }, 2000)
@@ -148,8 +158,6 @@ function App() {
   useEffect(() => {
     fetchWorkspaces()
   }, [])
-
-  // ================= STATUS STYLE =================
 
   const statusStyle = (status: string) => {
     switch (status) {
@@ -172,14 +180,12 @@ function App() {
           MASIS
         </h1>
 
-        {/* Error */}
         {error && (
           <div className="bg-red-100 text-red-700 p-2 rounded mb-4 text-sm">
             {error}
           </div>
         )}
 
-        {/* Workspace Dropdown */}
         <select
           value={selectedWorkspace}
           onChange={(e) =>
@@ -195,7 +201,6 @@ function App() {
           ))}
         </select>
 
-        {/* Create Workspace */}
         <input
           type="text"
           placeholder="New workspace"
@@ -222,75 +227,27 @@ function App() {
           </button>
         )}
 
-        {/* GLOBAL PROCESSING INDICATOR */}
-        {anyProcessing && (
-          <div className="mb-4 text-sm text-yellow-600 font-medium">
-            Processing documents...
-          </div>
-        )}
-
-        {/* DOCUMENT LIST */}
         <div className="flex-1 overflow-y-auto space-y-3">
-          {documents.map((doc) => {
-            const percent =
-              doc.total_chunks > 0
-                ? Math.floor(
-                    (doc.processed_chunks /
-                      doc.total_chunks) *
-                      100
-                  )
-                : 0
+          {documents.map((doc) => (
+            <div
+              key={doc.id}
+              className="p-3 border rounded bg-gray-50"
+            >
+              <div className="flex justify-between items-center">
+                <span className="truncate text-sm font-medium">
+                  {doc.file_name}
+                </span>
 
-            return (
-              <div
-                key={doc.id}
-                className="p-3 border rounded bg-gray-50"
-              >
-                <div className="flex justify-between items-center">
-                  <span className="truncate text-sm font-medium">
-                    {doc.file_name}
-                  </span>
-
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`text-xs px-2 py-1 rounded ${statusStyle(
-                        doc.status
-                      )}`}
-                    >
-                      {doc.status}
-                    </span>
-
-                    <button
-                      onClick={() =>
-                        handleDeleteDocument(doc.id)
-                      }
-                      className="text-gray-400 hover:text-red-500"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                </div>
-
-                {doc.status === "PROCESSING" &&
-                  doc.total_chunks > 0 && (
-                    <div className="mt-2">
-                      <div className="w-full bg-gray-200 h-2 rounded">
-                        <div
-                          className="bg-blue-600 h-2 rounded transition-all duration-300"
-                          style={{
-                            width: `${percent}%`
-                          }}
-                        />
-                      </div>
-                      <div className="text-xs text-gray-500 mt-1">
-                        {percent}% • {doc.processed_chunks} /{" "}
-                        {doc.total_chunks}
-                      </div>
-                    </div>
-                  )}
+                <span
+                  className={`text-xs px-2 py-1 rounded ${statusStyle(
+                    doc.status
+                  )}`}
+                >
+                  {doc.status}
+                </span>
               </div>
-            )
-          })}
+            </div>
+          ))}
         </div>
       </div>
 
@@ -302,7 +259,7 @@ function App() {
               {selectedWorkspace}
             </h2>
 
-            <div className="bg-white p-6 rounded shadow">
+            <div className="bg-white p-6 rounded shadow mb-8">
               <input
                 type="file"
                 multiple
@@ -315,12 +272,97 @@ function App() {
               <button
                 onClick={handleUpload}
                 disabled={loading}
-                className="bg-blue-600 text-white px-4 py-2 rounded disabled:opacity-50"
+                className="bg-blue-600 text-white px-4 py-2 rounded"
               >
-                {loading
-                  ? "Uploading..."
-                  : "Upload"}
+                {loading ? "Uploading..." : "Upload"}
               </button>
+            </div>
+
+            {/* MASIS QUERY */}
+            <div className="bg-white p-6 rounded shadow">
+              <h3 className="text-xl font-semibold mb-4">
+                Strategic Intelligence Query
+              </h3>
+
+              <textarea
+                value={query}
+                onChange={(e) =>
+                  setQuery(e.target.value)
+                }
+                placeholder="Ask a strategic question..."
+                className="w-full border rounded p-3 mb-4"
+                rows={4}
+              />
+
+              <button
+                onClick={handleMasisQuery}
+                disabled={masisLoading}
+                className="bg-purple-600 text-white px-4 py-2 rounded"
+              >
+                {masisLoading ? "Analyzing..." : "Run MASIS"}
+              </button>
+
+              {masisResult && (
+                <div className="mt-6 space-y-6">
+
+                  {/* HITL */}
+                  {masisResult.requires_human_review && (
+                    <div className="bg-orange-100 border border-orange-300 text-orange-800 p-4 rounded">
+                      ⚠ {masisResult.clarification_question}
+                    </div>
+                  )}
+
+                  {/* FINAL ANSWER */}
+                  <div>
+                    <h4 className="font-semibold mb-2">
+                      Final Answer
+                    </h4>
+                    <div className="bg-gray-100 p-4 rounded whitespace-pre-wrap">
+                      {masisResult.answer}
+                    </div>
+                  </div>
+
+                  {/* CONFIDENCE */}
+                  <div>
+                    <h4 className="font-semibold mb-2">
+                      Confidence
+                    </h4>
+                    <span className="px-3 py-1 rounded bg-blue-100 text-blue-700">
+                      {(masisResult.confidence * 100).toFixed(1)}%
+                    </span>
+                  </div>
+
+                  {/* METRICS */}
+                  {masisResult.metrics && (
+                    <details className="bg-white border rounded p-4">
+                      <summary className="cursor-pointer font-semibold">
+                        System Metrics
+                      </summary>
+
+                      <div className="mt-3 text-sm space-y-2">
+                        <div>
+                          Avg Retrieval Score:{" "}
+                          {masisResult.metrics.avg_retrieval_score?.toFixed(2)}
+                        </div>
+
+                        <div>
+                          Citations Used:{" "}
+                          {masisResult.metrics.citation_count}
+                        </div>
+
+                        {masisResult.metrics.node_latency_ms &&
+                          Object.entries(
+                            masisResult.metrics.node_latency_ms
+                          ).map(([node, time]) => (
+                            <div key={node}>
+                              {node}: {time} ms
+                            </div>
+                          ))}
+                      </div>
+                    </details>
+                  )}
+                </div>
+              )}
             </div>
           </>
         ) : (

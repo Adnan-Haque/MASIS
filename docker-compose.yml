@@ -40,6 +40,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+      qdrant:
+        condition: service_started
 
   worker:
     build: .
@@ -53,6 +55,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_started
+      qdrant:
         condition: service_started
 
 volumes:

@@ -25,3 +25,5 @@ pdf2image
 openai>=1.0.0
 
 PyPDF2
+
+langgraph

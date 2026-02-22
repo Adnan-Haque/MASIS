@@ -4,6 +4,7 @@ from app.api.workspace_routes import workspace_router
 from app.db.database import Base, engine
 import os
 from fastapi.middleware.cors import CORSMiddleware
+from app.api.masis_routes import masis_router
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 app = FastAPI()
@@ -22,3 +23,4 @@ Base.metadata.create_all(bind=engine)
 
 app.include_router(document_router)
 app.include_router(workspace_router)
+app.include_router(masis_router)

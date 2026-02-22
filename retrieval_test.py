@@ -1,6 +1,7 @@
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 from collections import defaultdict
+import json
 
 # =====================================================
 # CONFIG
@@ -28,12 +29,13 @@ count_result = client.count(
 )
 
 total_chunks = count_result.count
+
 print("\n===== WORKSPACE SUMMARY =====")
 print("Workspace ID:", WORKSPACE_ID)
 print("Total Chunks:", total_chunks)
 
 # =====================================================
-# 2️⃣ Scroll All Points
+# 2️⃣ Scroll All Points (WITH VECTORS)
 # =====================================================
 
 points, _ = client.scroll(
@@ -46,9 +48,9 @@ points, _ = client.scroll(
             )
         ]
     ),
-    limit=10000,  # increase if needed
+    limit=10000,
     with_payload=True,
-    with_vectors=False
+    with_vectors=True  # 🔥 important change
 )
 
 # =====================================================
@@ -82,8 +84,35 @@ print("--------------------------------")
 for i, point in enumerate(points[:3]):
     payload = point.payload
     text_preview = payload.get("text", "")[:200]
+
     print(f"\nDocument: {payload.get('file_name')}")
     print("Chunk Index:", payload.get("chunk_index"))
     print("Text Preview:", text_preview)
+
+# =====================================================
+# 5️⃣ FULL RAW RECORD (ONE COMPLETE ENTRY)
+# =====================================================
+
+if points:
+    sample_point = points[0]
+
+    print("\n===== FULL RECORD STRUCTURE =====")
+    print("--------------------------------")
+
+    print("\nPoint ID:")
+    print(sample_point.id)
+
+    print("\nVector Info:")
+    if sample_point.vector:
+        print("Vector Dimension:", len(sample_point.vector))
+        print("First 10 Vector Values:", sample_point.vector[:10])
+    else:
+        print("No vector stored")
+
+    print("\nPayload:")
+    print(json.dumps(sample_point.payload, indent=4))
+
+else:
+    print("\nNo records found in this workspace.")
 
 print("\n===== END SUMMARY =====")

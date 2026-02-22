@@ -22,19 +22,18 @@ embeddings = OpenAIEmbeddings(
 # Ensure Collection Exists
 # =====================================================
 
-def ensure_collection_exists():
 
+def ensure_collection_exists():
     collections = client.get_collections().collections
     existing = [c.name for c in collections]
 
-    if COLLECTION_NAME not in existing:
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(
-                size=1536,
-                distance=Distance.COSINE
-            ),
-        )
+    if "masis_documents" in existing:
+        return  # already exists, do nothing
+
+    client.create_collection(
+        collection_name="masis_documents",
+        vectors_config=...
+    )
 
 
 # =====================================================
