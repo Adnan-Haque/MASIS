@@ -501,3 +501,89 @@ def supervisor_node(state):
     })
 
     return state
+
+class Evaluation(BaseModel):
+    faithfulness: float        # groundedness (0–1)
+    relevance: float           # question alignment (0–1)
+    completeness: float        # coverage (0–1)
+    reasoning_quality: float   # clarity & logic (0–1)
+    overall_score: float       # weighted average
+    improvement_suggestions: list[str]
+
+
+def evaluator_node(state):
+    start = time.time()
+
+    state.setdefault("metrics", {})
+    state["metrics"].setdefault("evaluation", {})
+
+    query = state["user_query"]
+    answer = state.get("final_answer", "")
+    evidence = state.get("evidence", [])
+
+    context = "\n\n".join(
+        [f"[{e.chunk_id}] {e.text}" for e in evidence]
+    )
+
+    prompt = f"""
+You are an evaluation agent.
+
+Score strictly from 0 to 1:
+
+Faithfulness:
+1 = every claim directly supported by cited evidence
+0.5 = partially supported
+0 = unsupported
+
+Relevance:
+1 = fully answers user question
+0.5 = partially relevant
+0 = irrelevant
+
+Completeness:
+1 = covers all aspects of the question
+0.5 = partially complete
+0 = incomplete
+
+Reasoning Quality:
+1 = strong structured reasoning
+0.5 = shallow reasoning
+0 = no reasoning
+
+Be strict. Do NOT default to 1.
+
+Answer:
+{answer}
+
+Evidence:
+{context}
+"""
+
+    tagged_llm = (
+        critic_llm
+        .with_structured_output(Evaluation)
+        .with_config(tags=["evaluation"])
+    )
+
+    evaluation = tagged_llm.invoke(prompt)
+
+    if hasattr(evaluation, "model_dump"):
+        evaluation = evaluation.model_dump()
+
+    # Normalize scores
+    for k in ["faithfulness", "relevance", "completeness", "reasoning_quality", "overall_score"]:
+        if evaluation.get(k, 0) > 1:
+            evaluation[k] = evaluation[k] / 100.0
+
+    state["metrics"]["evaluation"] = evaluation
+
+    duration = int((time.time() - start) * 1000)
+    state["metrics"]["node_latency_ms"]["evaluator"] = duration
+
+    state["trace"].append({
+        "node": "evaluator",
+        "overall_score": evaluation.get("overall_score"),
+        "duration_ms": duration
+    })
+
+    return state
