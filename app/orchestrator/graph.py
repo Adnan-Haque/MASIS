@@ -6,8 +6,11 @@ from app.orchestrator.nodes import (
     critic_node,
     evaluator_node,
 )
+from app.orchestrator.state import MASISState
 
-builder = StateGraph(dict)
+# ✅ TypedDict state — supports both dict-style access (state["key"]) in nodes
+#    and Pydantic validation at the API boundary via MASISInput.to_state()
+builder = StateGraph(MASISState)
 
 builder.add_node("supervisor", supervisor_node)
 builder.add_node("researcher", researcher_node)
@@ -27,7 +30,7 @@ builder.add_edge("evaluator", "supervisor")
 # =========================================
 # Supervisor Controlled Routing
 # =========================================
-def route_from_supervisor(state):
+def route_from_supervisor(state: MASISState):
 
     # 🔴 HITL stops graph
     if state.get("requires_human_review"):
@@ -39,9 +42,9 @@ def route_from_supervisor(state):
     if last_trace.get("decision") == "retry":
         return "retry"
 
-    # 🔥 FIRST RUN: if no answer yet, start flow
+    # 🆕 First run: no answer yet, start the pipeline
     if state.get("draft_answer") is None:
-        return "retry"
+        return "first_run"
 
     # ✅ Finalize
     return "end"
@@ -52,6 +55,7 @@ builder.add_conditional_edges(
     route_from_supervisor,
     {
         "retry": "researcher",
+        "first_run": "researcher",  # Semantically distinct from retry
         "end": END,
     },
 )

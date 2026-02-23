@@ -2,38 +2,72 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 from pydantic import BaseModel
-from .state import EvidenceChunk
+from .state import EvidenceChunk, MASISState
 import time
 import re
+import threading
 
 # 🔹 IMPORTANT: Use Docker service name
 qdrant_client = QdrantClient(host="qdrant", port=6333)
 
 embeddings = OpenAIEmbeddings()
 
+# ✅ Model selection by task complexity:
+#    - gpt-4o-mini: generation (synthesizer, compression) — cheap, fast
+#    - gpt-4o: auditing & scoring (critic, evaluator) — stronger reasoning
 llm = ChatOpenAI(model="gpt-4o-mini")
-critic_llm = ChatOpenAI(model="gpt-4o-mini")
+critic_llm = ChatOpenAI(model="gpt-4o")
+evaluator_llm = ChatOpenAI(model="gpt-4o")
+
+# =========================================
+# Rate Limiting — token bucket (10 calls/min)
+# =========================================
+_rate_lock = threading.Lock()
+_call_timestamps = []
+MAX_CALLS_PER_MINUTE = 10
+
+def _rate_limit():
+    """Block if we've exceeded MAX_CALLS_PER_MINUTE in the last 60 seconds."""
+    with _rate_lock:
+        now = time.time()
+        global _call_timestamps
+        _call_timestamps = [t for t in _call_timestamps if now - t < 60]
+        if len(_call_timestamps) >= MAX_CALLS_PER_MINUTE:
+            sleep_for = 60 - (now - _call_timestamps[0])
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+        _call_timestamps.append(time.time())
+
+
+def _init_metrics(state: MASISState):
+    """Ensure metrics dict and all sub-keys exist."""
+    if "metrics" not in state or state["metrics"] is None:
+        state["metrics"] = {}
+    m = state["metrics"]
+    m.setdefault("node_latency_ms", {})
+    m.setdefault("confidence_history", [])
+    m.setdefault("retry_reasons", [])
+    m.setdefault("iterations", [])
+    m.setdefault("citation_violations", [])
+    m.setdefault("evaluation", {})
+
+    if "trace" not in state or state["trace"] is None:
+        state["trace"] = []
+
 
 # =========================================
 # 1️⃣ RESEARCHER NODE
 # =========================================
-def researcher_node(state):
+def researcher_node(state: MASISState) -> MASISState:
     start = time.time()
-
-    state.setdefault("metrics", {})
-    state["metrics"].setdefault("node_latency_ms", {})
-    state["metrics"].setdefault("confidence_history", [])
-    state["metrics"].setdefault("retry_reasons", [])
-    state["metrics"].setdefault("iterations", [])
-    state["metrics"].setdefault("citation_violations", [])
-    state.setdefault("trace", [])
+    _init_metrics(state)
 
     query = state["user_query"]
     workspace_id = state["workspace_id"]
     retry_count = state.get("retry_count", 0)
-    critique = state.get("critique", {})
+    critique = state.get("critique") or {}
 
-    # 🔥 Critique-aware augmentation
+    # 🔥 Critique-aware query augmentation on retry
     augmented_query = query
     if retry_count > 0 and critique:
         focus_terms = (
@@ -41,7 +75,7 @@ def researcher_node(state):
             critique.get("logical_gaps", [])
         )
         if focus_terms:
-            augmented_query += " " + " ".join(focus_terms)
+            augmented_query += " " + " ".join(str(t) for t in focus_terms)
 
     # 🔥 Dynamic retrieval expansion
     limit = 5 if retry_count == 0 else 10
@@ -78,8 +112,25 @@ def researcher_node(state):
                 )
             )
 
-    avg_score = sum(scores) / len(scores) if scores else 0
     duration = int((time.time() - start) * 1000)
+
+    # ✅ Handle empty retrieval gracefully — escalate to HITL immediately
+    if not evidence:
+        state["requires_human_review"] = True
+        state["clarification_question"] = (
+            "No relevant documents were found for your query in this workspace. "
+            "Please upload relevant documents or refine your question."
+        )
+        state["trace"].append({
+            "node": "researcher",
+            "retry_count": retry_count,
+            "warning": "zero_results_retrieved",
+            "duration_ms": duration
+        })
+        state["evidence"] = []
+        return state
+
+    avg_score = sum(scores) / len(scores)
 
     state["metrics"]["retrieval_scores"] = scores
     state["metrics"]["avg_retrieval_score"] = avg_score
@@ -101,17 +152,17 @@ def researcher_node(state):
 # =========================================
 # 2️⃣ SYNTHESIZER NODE (WITH CONTEXT CONTROL)
 # =========================================
-def synthesizer_node(state):
+def synthesizer_node(state: MASISState) -> MASISState:
     start = time.time()
+    _init_metrics(state)
 
     query = state["user_query"]
-    evidence = state["evidence"]
+    evidence = state.get("evidence", [])
     retry_count = state.get("retry_count", 0)
     critique = state.get("critique")
 
     compression_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-    # 🔥 Context size calculation
     original_context_chars = sum(len(e.text) for e in evidence)
     state["metrics"]["original_context_chars"] = original_context_chars
 
@@ -120,12 +171,9 @@ def synthesizer_node(state):
     compression_duration = 0
 
     if original_context_chars > MAX_CONTEXT_CHARS:
-
         compression_start = time.time()
 
-        # 🔥 Sort by relevance
         sorted_evidence = sorted(evidence, key=lambda x: x.score, reverse=True)
-
         top_chunks = sorted_evidence[:3]
         low_chunks = sorted_evidence[3:]
 
@@ -143,21 +191,16 @@ Format:
 Chunks:
 {formatted_chunks}
 """
-
+        _rate_limit()
         compressed_output = compression_llm.invoke(compress_prompt).content
 
-        # 🔥 Parse summaries
         compressed_map = {}
         for line in compressed_output.split("\n"):
             if ":" in line:
                 cid, summary = line.split(":", 1)
                 compressed_map[cid.strip().replace("[","").replace("]","")] = summary.strip()
 
-        compressed_evidence = []
-
-        for e in top_chunks:
-            compressed_evidence.append(e)
-
+        compressed_evidence = list(top_chunks)
         for e in low_chunks:
             summary = compressed_map.get(e.chunk_id, e.text[:200])
             compressed_evidence.append(
@@ -171,7 +214,6 @@ Chunks:
 
         evidence = compressed_evidence
         context_compressed = True
-
         compression_duration = int((time.time() - compression_start) * 1000)
 
         compressed_chars = sum(len(e.text) for e in evidence)
@@ -180,8 +222,15 @@ Chunks:
             compressed_chars / original_context_chars, 3
         )
 
+        # ✅ Over-compression: signal supervisor to retry with broader retrieval
         if compressed_chars / original_context_chars < 0.35:
             state["metrics"]["over_compression_flag"] = True
+            current_critique = state.get("critique") or {}
+            current_critique["needs_retry"] = True
+            current_critique["logical_gaps"] = current_critique.get("logical_gaps", []) + [
+                "Evidence was over-compressed; critical context may have been lost."
+            ]
+            state["critique"] = current_critique
 
     context = "\n\n".join(
         [f"[{e.chunk_id}] {e.text}" for e in evidence]
@@ -199,9 +248,9 @@ Correct these issues.
 """
 
     prompt = f"""
-Use ONLY the evidence.
+Use ONLY the evidence below.
 Every claim must cite [chunk_id].
-If insufficient evidence, say so.
+If there is insufficient evidence, explicitly state so.
 
 {critique_feedback}
 
@@ -220,6 +269,7 @@ Evidence:
         }
     )
 
+    _rate_limit()
     response = tagged_llm.invoke(prompt)
     answer = response.content
 
@@ -246,6 +296,7 @@ Evidence:
     state["draft_answer"] = answer
     return state
 
+
 # =========================================
 # 3️⃣ CRITIC NODE + HARD CITATION ENGINE
 # =========================================
@@ -254,20 +305,16 @@ class Critique(BaseModel):
     hallucination_detected: bool
     unsupported_claims: list[str]
     logical_gaps: list[str]
-    conflicting_evidence: list[dict]
+    conflicting_evidence: list[str]   # ✅ list[str] — matches prompt instruction
     needs_retry: bool
 
 
-def critic_node(state):
+def critic_node(state: MASISState) -> MASISState:
     start = time.time()
+    _init_metrics(state)
 
-    state.setdefault("metrics", {})
-    state["metrics"].setdefault("node_latency_ms", {})
-    state["metrics"].setdefault("citation_violations", [])
-    state["metrics"].setdefault("confidence_history", [])
-
-    answer = state["draft_answer"]
-    evidence = state["evidence"]
+    answer = state.get("draft_answer", "")
+    evidence = state.get("evidence", [])
 
     context = "\n\n".join(
         [f"[{e.chunk_id}] {e.text}" for e in evidence]
@@ -299,35 +346,28 @@ Evidence:
         .with_config(tags=["critic"])
     )
 
+    _rate_limit()
     critique = tagged_llm.invoke(prompt)
 
     if hasattr(critique, "model_dump"):
         critique = critique.model_dump()
 
-    # ===============================
-    # 🔥 Normalize Confidence
-    # ===============================
+    # Normalize confidence to 0–1
     confidence = critique.get("confidence", 0.0)
-
-    # Handle 0–100 scale
     if confidence > 1:
         confidence = confidence / 100.0
-
     confidence = max(0.0, min(confidence, 1.0))
     critique["confidence"] = confidence
 
     # ===============================
     # 🔥 HARD CITATION ENGINE
     # ===============================
-    import re
-
     citations = re.findall(r"\[(.*?)\]", answer)
     valid_ids = {e.chunk_id for e in evidence}
 
     invalid_citations = [c for c in citations if c not in valid_ids]
 
     sentences = re.split(r"[.!?]", answer)
-
     uncited_claims = [
         s.strip()
         for s in sentences
@@ -338,33 +378,24 @@ Evidence:
         and "cannot provide" not in s.lower()
     ]
 
-    # ===============================
-    # 🔥 Penalty Logic (Stable)
-    # ===============================
+    # Penalty logic
     penalty_factor = 1.0
-
     if invalid_citations:
         critique["hallucination_detected"] = True
         critique["needs_retry"] = True
         penalty_factor *= 0.5
-
     if uncited_claims and citations:
         penalty_factor *= 0.9
 
-    confidence = confidence * penalty_factor
-    confidence = max(0.0, min(confidence, 1.0))
-
+    confidence = max(0.0, min(confidence * penalty_factor, 1.0))
     critique["confidence"] = confidence
 
-    # ===============================
-    # Save Telemetry
-    # ===============================
+    # Telemetry
     state["metrics"]["citation_violations"].append({
         "invalid_ids": invalid_citations,
         "uncited_claims": len(uncited_claims),
         "iteration": state.get("retry_count", 0)
     })
-
     state["metrics"]["confidence_history"].append(confidence)
 
     state["critique"] = critique
@@ -391,33 +422,67 @@ Evidence:
 # =========================================
 # 4️⃣ SUPERVISOR NODE
 # =========================================
-def supervisor_node(state):
+def supervisor_node(state: MASISState) -> MASISState:
+    _init_metrics(state)
 
+    # First call — no answer yet, pass through to start the pipeline
     if state.get("draft_answer") is None:
         return state
 
-    critique = state.get("critique", {})
+    critique = state.get("critique") or {}
     confidence = critique.get("confidence", 0.0)
     retry_count = state.get("retry_count", 0)
-    max_retries = state.get("max_retries", 2)
+    max_retries = state.get("max_retries") or 2
 
-    metrics = state.get("metrics", {})
-    citation_violations = metrics.get("citation_violations", [])
-    confidence_history = metrics.get("confidence_history", [])
+    citation_violations = state["metrics"].get("citation_violations", [])
 
-    state.setdefault("requires_human_review", False)
-    state.setdefault("clarification_question", None)
-    state.setdefault("trace", [])
+    citation_issue = False
+    if citation_violations:
+        latest = citation_violations[-1]
+        if latest.get("invalid_ids"):
+            citation_issue = True
+
+    hallucination_flag = critique.get("hallucination_detected", False)
+    critic_retry_flag = critique.get("needs_retry", False)
+    has_conflicts = bool(critique.get("conflicting_evidence"))
 
     LOW_CONF_THRESHOLD = 0.75
 
+    quality_issue = (
+        confidence < LOW_CONF_THRESHOLD
+        or citation_issue
+        or hallucination_flag
+        or critic_retry_flag
+    )
+
     # =====================================================
-    # 1️⃣ Hard Conflict Escalation
+    # 1️⃣ Retry — attempt resolution before escalating
     # =====================================================
-    if critique.get("conflicting_evidence"):
+    if (quality_issue or has_conflicts) and retry_count < max_retries:
+        state["retry_count"] = retry_count + 1
+
+        reason = "quality_issue_detected"
+        if has_conflicts and not quality_issue:
+            reason = "conflicting_evidence_attempting_resolution"
+
+        state["trace"].append({
+            "node": "supervisor",
+            "decision": "retry",
+            "confidence": confidence,
+            "retry_count": state["retry_count"],
+            "reason": reason
+        })
+
+        return state
+
+    # =====================================================
+    # 2️⃣ HITL — conflict could not be resolved after retries
+    # =====================================================
+    if has_conflicts and retry_count >= max_retries:
         state["requires_human_review"] = True
         state["clarification_question"] = (
-            "Conflicting information detected across documents. "
+            "Conflicting information was detected across documents and could not be "
+            "automatically resolved after multiple attempts. "
             "Please review the competing claims and select a preferred source."
         )
 
@@ -431,54 +496,14 @@ def supervisor_node(state):
         return state
 
     # =====================================================
-    # 2️⃣ Quality Signals
-    # =====================================================
-    citation_issue = False
-    uncited_claims = False
-
-    if citation_violations:
-        latest = citation_violations[-1]
-        if latest.get("invalid_ids"):
-            citation_issue = True
-        if latest.get("uncited_claims", 0) > 0:
-            uncited_claims = True
-
-    hallucination_flag = critique.get("hallucination_detected", False)
-    critic_retry_flag = critique.get("needs_retry", False)
-
-    quality_issue = (
-        confidence < LOW_CONF_THRESHOLD
-        or citation_issue
-        or hallucination_flag
-        or critic_retry_flag
-    )
-
-    # =====================================================
-    # 3️⃣ Retry Logic
-    # =====================================================
-    if quality_issue and retry_count < max_retries:
-        state["retry_count"] += 1
-
-        state["trace"].append({
-            "node": "supervisor",
-            "decision": "retry",
-            "confidence": confidence,
-            "retry_count": state["retry_count"],
-            "reason": "quality_issue_detected"
-        })
-
-        return state
-
-    # =====================================================
-    # 4️⃣ HITL Trigger (Only If Retries Exhausted)
+    # 3️⃣ HITL — quality issue, retries exhausted
     # =====================================================
     if quality_issue and retry_count >= max_retries:
         state["requires_human_review"] = True
-
         state["clarification_question"] = (
             f"After {max_retries} refinement attempts, confidence remains "
-            f"{round(confidence*100,1)}%. "
-            "You may refine the query or upload additional evidence."
+            f"{round(confidence * 100, 1)}%. "
+            "You may refine your query or upload additional evidence."
         )
 
         state["trace"].append({
@@ -491,7 +516,7 @@ def supervisor_node(state):
         return state
 
     # =====================================================
-    # 5️⃣ Finalize (Healthy State)
+    # 4️⃣ Finalize — healthy state
     # =====================================================
     state["trace"].append({
         "node": "supervisor",
@@ -502,20 +527,22 @@ def supervisor_node(state):
 
     return state
 
+
+# =========================================
+# 5️⃣ EVALUATOR NODE (LLM-as-Judge)
+# =========================================
 class Evaluation(BaseModel):
-    faithfulness: float        # groundedness (0–1)
-    relevance: float           # question alignment (0–1)
-    completeness: float        # coverage (0–1)
-    reasoning_quality: float   # clarity & logic (0–1)
-    overall_score: float       # weighted average
+    faithfulness: float
+    relevance: float
+    completeness: float
+    reasoning_quality: float
+    overall_score: float
     improvement_suggestions: list[str]
 
 
-def evaluator_node(state):
+def evaluator_node(state: MASISState) -> MASISState:
     start = time.time()
-
-    state.setdefault("metrics", {})
-    state["metrics"].setdefault("evaluation", {})
+    _init_metrics(state)
 
     query = state["user_query"]
     answer = state.get("final_answer", "")
@@ -525,6 +552,7 @@ def evaluator_node(state):
         [f"[{e.chunk_id}] {e.text}" for e in evidence]
     )
 
+    # ✅ user_query included so Relevance and Completeness can be scored meaningfully
     prompt = f"""
 You are an evaluation agent.
 
@@ -552,6 +580,9 @@ Reasoning Quality:
 
 Be strict. Do NOT default to 1.
 
+Question:
+{query}
+
 Answer:
 {answer}
 
@@ -560,11 +591,12 @@ Evidence:
 """
 
     tagged_llm = (
-        critic_llm
+        evaluator_llm
         .with_structured_output(Evaluation)
         .with_config(tags=["evaluation"])
     )
 
+    _rate_limit()
     evaluation = tagged_llm.invoke(prompt)
 
     if hasattr(evaluation, "model_dump"):
@@ -583,6 +615,9 @@ Evidence:
     state["trace"].append({
         "node": "evaluator",
         "overall_score": evaluation.get("overall_score"),
+        "faithfulness": evaluation.get("faithfulness"),
+        "relevance": evaluation.get("relevance"),
+        "completeness": evaluation.get("completeness"),
         "duration_ms": duration
     })
 
