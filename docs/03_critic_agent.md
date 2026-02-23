@@ -2,9 +2,7 @@
 
 ## Role & Persona
 
-The Critic is the **"Auditor"** of MASIS. It receives the Synthesizer's draft answer and subjects it to two layers of scrutiny: an **LLM-based semantic audit** (to catch hallucinations, logical gaps, and conflicting evidence that require reasoning to detect) and a **deterministic citation engine** (to catch invalid or missing references that can be verified purely through code). Together, these two layers form the most important quality gate in the system.
-
-No answer leaves MASIS without passing through the Critic.
+The Critic is the **"Auditor"** of MASIS. It receives the Synthesizer's draft answer and subjects it to two layers of scrutiny: an **LLM-based semantic audit** (catches hallucinations, logical gaps, and conflicting evidence requiring reading comprehension) and a **deterministic citation engine** (catches invalid or missing references verifiable purely through code). No answer leaves MASIS without passing through the Critic.
 
 ---
 
@@ -12,13 +10,11 @@ No answer leaves MASIS without passing through the Critic.
 
 ### Problem 1: LLMs Cannot Self-Audit Reliably
 
-Asking the same model that generated an answer to also check it for hallucinations is deeply unreliable. The model has the same biases and knowledge gaps that produced the hallucination in the first place — it will often validate its own mistakes.
+Asking the same model that generated an answer to also check it for hallucinations is unreliable. The model has the same biases and knowledge gaps that produced the hallucination — it validates its own mistakes.
 
 **How MASIS solves it — Separate Critic Agent with a Stronger Model:**
 
-The Critic is a **distinct LLM call** using **`gpt-4o`** (while the Synthesizer uses `gpt-4o-mini`). This is a deliberate asymmetry — the auditor is more powerful than the writer, making it less likely to be fooled by a plausible-sounding but unsupported claim.
-
-The Critic receives the draft answer and the full evidence context, but is given a completely different system identity and task:
+The Critic is a **distinct LLM call** using **`gpt-4o`** (while the Synthesizer uses `gpt-4o-mini`). The auditor is more powerful than the writer. It receives the draft answer and full evidence context but is given a completely different identity:
 
 ```
 You are an AI Auditor.
@@ -29,9 +25,9 @@ It is never told what the "correct" answer should be — only what the evidence 
 
 ---
 
-### Problem 2: Structured Auditing Without Free-Form Text
+### Problem 2: Routing Requires Structured, Programmatic Signals
 
-If the Critic returned a free-form critique ("I think claim 3 might be unsupported..."), the Supervisor would have no reliable way to extract actionable signals. It couldn't programmatically detect whether a hallucination was found, or whether a retry was needed.
+If the Critic returned free-form text ("I think claim 3 might be unsupported..."), the Supervisor couldn't reliably extract actionable signals.
 
 **How MASIS solves it — Pydantic Structured Output:**
 
@@ -45,42 +41,36 @@ class Critique(BaseModel):
     needs_retry: bool
 ```
 
-LangChain's `.with_structured_output(Critique)` forces the LLM's response through OpenAI's function-calling mechanism, which guarantees the output conforms to this schema. Every field is typed and required. The Supervisor can then read `critique["hallucination_detected"]` and `critique["needs_retry"]` as binary signals, without any natural-language parsing.
+`.with_structured_output(Critique)` forces the response through OpenAI's function-calling mechanism — every field is typed and required. The Supervisor reads `critique["hallucination_detected"]` and `critique["needs_retry"]` as binary signals with no natural-language parsing.
 
 ---
 
-### Problem 3: Hallucinated Citations — References to Chunks That Don't Exist
+### Problem 3: Hallucinated Citations — References to Non-Existent Chunks
 
-An LLM under citation pressure will sometimes fabricate chunk IDs. For example, the Synthesizer might write `"Revenue declined [chunk_99]"` when no chunk with ID `chunk_99` was ever retrieved. This is a particularly dangerous hallucination because it *looks* cited — it has a bracket reference — but it points to nothing.
+An LLM under citation pressure fabricates chunk IDs. `"Revenue declined [chunk_99]"` when no `chunk_99` was ever retrieved. This looks cited but points to nothing — a structural hallucination invisible to the LLM's own audit.
 
-**How MASIS solves it — The Hard Citation Engine (Deterministic Check):**
+**How MASIS solves it — The Hard Citation Engine:**
 
 ```python
 citations = re.findall(r"\[(.*?)\]", answer)
 valid_ids = {e.chunk_id for e in evidence}
 invalid_citations = [c for c in citations if c not in valid_ids]
-```
 
-All `[...]` patterns in the answer are extracted with a regex. The set of valid chunk IDs (from the actual retrieved evidence) is computed. Any citation referencing an ID not in that set is flagged as **invalid** — a confirmed hallucination.
-
-When invalid citations are found:
-
-```python
 if invalid_citations:
     critique["hallucination_detected"] = True
     critique["needs_retry"] = True
-    penalty_factor *= 0.5
+    penalty_factor *= 0.5   # hard 50% confidence penalty
 ```
 
-Hallucination is hard-set to `True` (overriding the LLM's own assessment), retry is required, and a 50% confidence penalty is applied. This is non-negotiable — fabricated citations are treated as critical failures.
+Every `[...]` pattern is extracted with regex. Any citation referencing an ID not in `valid_ids` is a confirmed fabrication. Hallucination is hard-set to `True` (overriding the LLM's own assessment), retry is forced, and a 50% confidence penalty is applied. Non-negotiable.
 
 ---
 
 ### Problem 4: Claims Made Without Any Citation
 
-Beyond fake citations, there's a softer problem: claims made with no citation at all. A sentence like "The company's strategy is primarily defensive" might be the Synthesizer's inference or prior knowledge — not derived from the evidence.
+Beyond fake citations, there's a softer problem: factual sentences with no citation at all. The Synthesizer may draw on prior knowledge outside the evidence.
 
-**How MASIS solves it — Uncited Claims Detection:**
+**How MASIS solves it — Uncited Claims Detection with Proportional Penalty:**
 
 ```python
 sentences = re.split(r"[.!?]", answer)
@@ -92,25 +82,31 @@ uncited_claims = [
     and "insufficient evidence" not in s.lower()
     and "not provided" not in s.lower()
     and "cannot provide" not in s.lower()
+    and "lack sufficient evidence" not in s.lower()
+    and "partially covers" not in s.lower()
 ]
 ```
 
-Every sentence in the answer is checked. If a sentence contains no `[` character (no citation) and doesn't use explicit hedging language like "insufficient evidence", it's classified as an uncited claim. These aren't as severe as fake citations, but they indicate the Synthesizer is drawing on knowledge outside the evidence.
+Every sentence is checked. Explicit hedge phrases — including `"lack sufficient evidence"` and `"partially covers"` which the Synthesizer's prompt now encourages — are excluded from the penalty. These are valid statements of evidence boundaries, not uncited claims.
 
-The penalty is lighter:
+Penalty logic:
 
 ```python
-if uncited_claims and citations:
-    penalty_factor *= 0.9  # 10% confidence penalty
+if uncited_claims:
+    uncited_penalty = min(0.40, len(uncited_claims) * 0.03)  # 3% per claim, capped at 40%
+    penalty_factor *= (1.0 - uncited_penalty)
+
+    if len(uncited_claims) >= 5:
+        critique["needs_retry"] = True  # force retry if heavily uncited
 ```
 
-Note the condition: `if uncited_claims and citations`. If there are *no* citations at all in the answer, this check is skipped — the entire answer is likely already flagged by the LLM-based audit as having `hallucination_detected = True`.
+The penalty is **proportional** — a single uncited sentence loses 3% confidence, five uncited sentences lose 15%, ten uncited sentences cap at 40%. This is more calibrated than a flat penalty, which would treat one introductory sentence the same as ten unsupported claims.
 
 ---
 
-### Problem 5: Confidence Scores on Different Scales
+### Problem 5: Confidence Scores on Wrong Scale
 
-The LLM might return `confidence: 0.85` or it might return `confidence: 85` — both are valid interpretations of "85% confident" but only one is correct in a 0–1 float scale.
+Some LLMs return `confidence: 85` instead of `confidence: 0.85`.
 
 **How MASIS solves it — Confidence Normalization:**
 
@@ -121,34 +117,29 @@ if confidence > 1:
 confidence = max(0.0, min(confidence, 1.0))
 ```
 
-Any value above 1 is divided by 100, then the result is clamped to `[0.0, 1.0]`. This handles both 0–1 and 0–100 LLM output conventions without failing.
+Any value above 1 is divided by 100, then clamped to `[0.0, 1.0]`.
 
 ---
 
-### Problem 6: Confidence Doesn't Reflect Citation Quality
+### Problem 6: LLM Confidence Doesn't Reflect Citation Failures
 
-The LLM's `confidence` field reflects its own reasoning about the answer's quality. But it cannot see the citation engine's deterministic findings — those are computed after the LLM response is received. So the LLM might report high confidence even if the code finds invalid citations.
+The LLM's `confidence` reflects its semantic judgment — computed before the citation engine runs. The LLM might report high confidence even when the code finds invalid citations.
 
-**How MASIS solves it — Post-Hoc Penalty to Combine Both Signals:**
+**How MASIS solves it — Post-Hoc Penalty Fusing Both Signals:**
 
 ```python
 penalty_factor = 1.0
 if invalid_citations:
-    penalty_factor *= 0.5    # severe penalty for fake citations
-if uncited_claims and citations:
-    penalty_factor *= 0.9    # mild penalty for uncited sentences
+    penalty_factor *= 0.5    # 50% for fabricated chunk IDs
+if uncited_claims:
+    uncited_penalty = min(0.40, len(uncited_claims) * 0.03)
+    penalty_factor *= (1.0 - uncited_penalty)
 
 confidence = max(0.0, min(confidence * penalty_factor, 1.0))
 critique["confidence"] = confidence
 ```
 
-The final confidence is the LLM's raw score multiplied by the penalty factor. This fuses the LLM's semantic judgment with the code's deterministic citation findings into a single score the Supervisor uses for routing.
-
----
-
-### Problem 7: Setting `final_answer` Prematurely
-
-The Critic also sets `state["final_answer"] = answer`. This might seem odd — why does the Auditor set the final answer? The reason is that `final_answer` at this point means "the best draft we have so far, fully audited." If the Supervisor decides to finalize, this value is returned. If it decides to retry, a new draft will overwrite it on the next Synthesizer pass.
+Final confidence = LLM semantic score × penalty_factor. This fuses LLM judgment with deterministic citation findings into one score the Supervisor uses for routing.
 
 ---
 
@@ -156,14 +147,14 @@ The Critic also sets `state["final_answer"] = answer`. This might seem odd — w
 
 | Field | Direction | Description |
 |---|---|---|
-| `draft_answer` | Input | The Synthesizer's generated answer |
-| `evidence` | Input | The evidence chunks (used to validate citations) |
-| `retry_count` | Input | Used for telemetry only |
+| `draft_answer` | Input | Synthesizer's generated answer |
+| `evidence` | Input | Evidence chunks (for citation validation) |
+| `retry_count` | Input | Telemetry only |
 | `critique` | **Output** | Full structured audit result |
 | `confidence` | **Output** | Final penalized confidence score |
 | `final_answer` | **Output** | Mirror of `draft_answer` (current best draft) |
-| `metrics` | **Output** | `citation_violations`, `confidence_history`, `node_latency_ms` |
-| `trace` | **Output** | Appended audit summary |
+| `metrics` | **Output** | `citation_violations`, `confidence_history`, `last_citation_audit`, `node_latency_ms` |
+| `trace` | **Output** | Audit summary entry |
 
 ---
 
@@ -186,4 +177,6 @@ The Critic also sets `state["final_answer"] = answer`. This might seem odd — w
 
 ## Why Two Layers of Auditing?
 
-The LLM layer catches **semantic hallucinations** — claims that are plausible but ungrounded, logical leaps, contradictions that require reading comprehension to spot. The citation engine catches **structural hallucinations** — fake IDs, missing brackets — that are trivially detectable with code but that the LLM might not flag. Neither layer alone is sufficient. Together they cover both reasoning-level and format-level quality failures.
+The LLM layer catches **semantic hallucinations** — plausible but ungrounded claims, logical leaps, contradictions requiring reading comprehension. The citation engine catches **structural hallucinations** — fake IDs, missing brackets — trivially detectable with code but that the LLM may not flag. Neither layer alone is sufficient. Together they cover both reasoning-level and format-level quality failures.
+
+The Critic also passes `last_citation_audit` into `state["metrics"]` — a structured summary of all citation findings — which the Evaluator then uses to calibrate its faithfulness scores. This creates a direct signal path from deterministic code findings to the LLM-as-judge evaluation.

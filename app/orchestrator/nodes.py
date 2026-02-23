@@ -58,6 +58,14 @@ def _init_metrics(state: MASISState):
 # =========================================
 # 1️⃣ RESEARCHER NODE
 # =========================================
+
+# Minimum Qdrant similarity score to accept a chunk as evidence.
+# Chunks below this threshold are too semantically distant from the query
+# to be useful — including them poisons the synthesizer with weak evidence,
+# leading to vague answers and low confidence scores.
+# 0.60 is a conservative threshold for cosine similarity with OpenAI embeddings.
+MIN_SCORE_THRESHOLD = 0.60
+
 def researcher_node(state: MASISState) -> MASISState:
     start = time.time()
     _init_metrics(state)
@@ -77,8 +85,9 @@ def researcher_node(state: MASISState) -> MASISState:
         if focus_terms:
             augmented_query += " " + " ".join(str(t) for t in focus_terms)
 
-    # 🔥 Dynamic retrieval expansion
-    limit = 5 if retry_count == 0 else 10
+    # 🔥 Dynamic retrieval expansion — fetch more candidates on retry
+    # so the score filter has more to work with
+    limit = 10 if retry_count == 0 else 20
     query_vector = embeddings.embed_query(augmented_query)
 
     results = qdrant_client.search(
@@ -98,33 +107,53 @@ def researcher_node(state: MASISState) -> MASISState:
     seen_ids = set()
     evidence = []
     scores = []
+    filtered_out = 0
 
     for r in results:
-        if str(r.id) not in seen_ids:
-            seen_ids.add(str(r.id))
-            scores.append(r.score)
-            evidence.append(
-                EvidenceChunk(
-                    chunk_id=str(r.id),
-                    file_name=r.payload.get("file_name"),
-                    text=r.payload.get("text"),
-                    score=r.score
-                )
+        if str(r.id) in seen_ids:
+            continue
+        seen_ids.add(str(r.id))
+
+        # ✅ Score threshold — drop chunks that are too weakly matched.
+        # On retry, lower threshold slightly to allow broader coverage
+        # when the query was augmented with critic feedback.
+        threshold = MIN_SCORE_THRESHOLD if retry_count == 0 else MIN_SCORE_THRESHOLD - 0.05
+        if r.score < threshold:
+            filtered_out += 1
+            continue
+
+        scores.append(r.score)
+        evidence.append(
+            EvidenceChunk(
+                chunk_id=str(r.id),
+                file_name=r.payload.get("file_name"),
+                text=r.payload.get("text"),
+                score=r.score
             )
+        )
 
     duration = int((time.time() - start) * 1000)
 
     # ✅ Handle empty retrieval gracefully — escalate to HITL immediately
     if not evidence:
-        state["requires_human_review"] = True
-        state["clarification_question"] = (
+        # If chunks existed but all were filtered out, give a more specific message
+        clarification = (
+            "Your query did not match any documents with sufficient relevance. "
+            "Try rephrasing with more specific terms from your documents, "
+            "or upload documents that cover this topic."
+        ) if filtered_out > 0 else (
             "No relevant documents were found for your query in this workspace. "
             "Please upload relevant documents or refine your question."
         )
+
+        state["requires_human_review"] = True
+        state["clarification_question"] = clarification
         state["trace"].append({
             "node": "researcher",
             "retry_count": retry_count,
-            "warning": "zero_results_retrieved",
+            "warning": "no_qualifying_evidence",
+            "results_before_filter": filtered_out,
+            "threshold_used": MIN_SCORE_THRESHOLD if retry_count == 0 else MIN_SCORE_THRESHOLD - 0.05,
             "duration_ms": duration
         })
         state["evidence"] = []
@@ -139,8 +168,10 @@ def researcher_node(state: MASISState) -> MASISState:
     state["trace"].append({
         "node": "researcher",
         "retry_count": retry_count,
-        "chunks": len(scores),
+        "chunks": len(evidence),
+        "filtered_out": filtered_out,
         "avg_score": round(avg_score, 3),
+        "threshold_used": MIN_SCORE_THRESHOLD if retry_count == 0 else MIN_SCORE_THRESHOLD - 0.05,
         "augmented_query_used": retry_count > 0,
         "duration_ms": duration
     })
@@ -248,9 +279,11 @@ Correct these issues.
 """
 
     prompt = f"""
-Use ONLY the evidence below.
-Every claim must cite [chunk_id].
-If there is insufficient evidence, explicitly state so.
+You are a strategic intelligence analyst.
+Use ONLY the evidence below to answer the question.
+Every factual claim MUST cite its source using [chunk_id].
+If the evidence only partially covers the question, answer what you can and
+explicitly state which aspects lack sufficient evidence — do not fabricate.
 
 {critique_feedback}
 
@@ -305,7 +338,7 @@ class Critique(BaseModel):
     hallucination_detected: bool
     unsupported_claims: list[str]
     logical_gaps: list[str]
-    conflicting_evidence: list[str]   # ✅ list[str] — matches prompt instruction
+    conflicting_evidence: list[str]
     needs_retry: bool
 
 
@@ -376,16 +409,33 @@ Evidence:
         and "insufficient evidence" not in s.lower()
         and "not provided" not in s.lower()
         and "cannot provide" not in s.lower()
+        and "lack sufficient evidence" not in s.lower()
+        and "partially covers" not in s.lower()
     ]
 
-    # Penalty logic
+    # ===============================
+    # 🔥 Proportional penalty logic
+    # ===============================
     penalty_factor = 1.0
+
+    # Invalid citations: hard 50% penalty + force retry
     if invalid_citations:
         critique["hallucination_detected"] = True
         critique["needs_retry"] = True
         penalty_factor *= 0.5
-    if uncited_claims and citations:
-        penalty_factor *= 0.9
+
+    # Uncited claims: proportional penalty, 3% per claim, capped at 40%
+    if uncited_claims:
+        uncited_penalty = min(0.40, len(uncited_claims) * 0.03)
+        penalty_factor *= (1.0 - uncited_penalty)
+
+        # Force retry if 5+ uncited claims — answer is insufficiently grounded
+        if len(uncited_claims) >= 5:
+            critique["needs_retry"] = True
+            critique["unsupported_claims"] = (
+                critique.get("unsupported_claims", []) +
+                [f"{len(uncited_claims)} sentences contain no citation and require evidence support"]
+            )
 
     confidence = max(0.0, min(confidence * penalty_factor, 1.0))
     critique["confidence"] = confidence
@@ -397,6 +447,15 @@ Evidence:
         "iteration": state.get("retry_count", 0)
     })
     state["metrics"]["confidence_history"].append(confidence)
+
+    # Store citation engine findings for evaluator to consume
+    state["metrics"]["last_citation_audit"] = {
+        "invalid_citations": invalid_citations,
+        "uncited_claim_count": len(uncited_claims),
+        "uncited_claim_sentences": uncited_claims,
+        "hallucination_detected": critique.get("hallucination_detected", False),
+        "unsupported_claims": critique.get("unsupported_claims", []),
+    }
 
     state["critique"] = critique
     state["confidence"] = confidence
@@ -446,7 +505,7 @@ def supervisor_node(state: MASISState) -> MASISState:
     critic_retry_flag = critique.get("needs_retry", False)
     has_conflicts = bool(critique.get("conflicting_evidence"))
 
-    LOW_CONF_THRESHOLD = 0.75
+    LOW_CONF_THRESHOLD = 0.65
 
     quality_issue = (
         confidence < LOW_CONF_THRESHOLD
@@ -464,6 +523,14 @@ def supervisor_node(state: MASISState) -> MASISState:
         reason = "quality_issue_detected"
         if has_conflicts and not quality_issue:
             reason = "conflicting_evidence_attempting_resolution"
+
+        state["metrics"]["retry_reasons"].append({
+            "iteration": retry_count + 1,
+            "confidence": confidence,
+            "reason": reason,
+            "citation_issue": citation_issue,
+            "hallucination": hallucination_flag,
+        })
 
         state["trace"].append({
             "node": "supervisor",
@@ -547,12 +614,35 @@ def evaluator_node(state: MASISState) -> MASISState:
     query = state["user_query"]
     answer = state.get("final_answer", "")
     evidence = state.get("evidence", [])
+    critique = state.get("critique") or {}
 
     context = "\n\n".join(
         [f"[{e.chunk_id}] {e.text}" for e in evidence]
     )
 
-    # ✅ user_query included so Relevance and Completeness can be scored meaningfully
+    # Feed critic audit findings into evaluator
+    # so it cannot ignore citation failures when scoring
+    citation_audit = state.get("metrics", {}).get("last_citation_audit", {})
+    invalid_citations = citation_audit.get("invalid_citations", [])
+    uncited_count = citation_audit.get("uncited_claim_count", 0)
+    hallucination_detected = citation_audit.get("hallucination_detected", False)
+    unsupported_claims = citation_audit.get("unsupported_claims", [])
+
+    citation_context = f"""
+=== Citation Audit Results (from Critic) ===
+- Invalid citation IDs found: {invalid_citations if invalid_citations else "None"}
+- Sentences with NO citation: {uncited_count}
+- Hallucination detected: {hallucination_detected}
+- Unsupported claims flagged: {unsupported_claims if unsupported_claims else "None"}
+
+IMPORTANT scoring rules based on the audit above:
+- If uncited sentences >= 5, Faithfulness MUST be <= 0.5
+- If uncited sentences >= 10, Faithfulness MUST be <= 0.3
+- If hallucination_detected is True, Faithfulness MUST be <= 0.4
+- If invalid citations exist, Faithfulness MUST be <= 0.4
+- These are hard constraints — do not override them regardless of how coherent the answer reads.
+"""
+
     prompt = f"""
 You are an evaluation agent.
 
@@ -578,7 +668,9 @@ Reasoning Quality:
 0.5 = shallow reasoning
 0 = no reasoning
 
-Be strict. Do NOT default to 1.
+Be strict. Do NOT default to 1. Use the citation audit findings to calibrate Faithfulness accurately.
+
+{citation_context}
 
 Question:
 {query}
@@ -602,10 +694,29 @@ Evidence:
     if hasattr(evaluation, "model_dump"):
         evaluation = evaluation.model_dump()
 
-    # Normalize scores
+    # Normalize scores to 0–1
     for k in ["faithfulness", "relevance", "completeness", "reasoning_quality", "overall_score"]:
         if evaluation.get(k, 0) > 1:
             evaluation[k] = evaluation[k] / 100.0
+
+    # Hard clamp: enforce citation audit constraints
+    # even if the LLM ignored them
+    if hallucination_detected or invalid_citations:
+        evaluation["faithfulness"] = min(evaluation["faithfulness"], 0.4)
+
+    if uncited_count >= 10:
+        evaluation["faithfulness"] = min(evaluation["faithfulness"], 0.3)
+    elif uncited_count >= 5:
+        evaluation["faithfulness"] = min(evaluation["faithfulness"], 0.5)
+
+    # Recalculate overall_score as weighted mean after clamping
+    evaluation["overall_score"] = round(
+        evaluation["faithfulness"] * 0.35 +
+        evaluation["relevance"] * 0.25 +
+        evaluation["completeness"] * 0.25 +
+        evaluation["reasoning_quality"] * 0.15,
+        3
+    )
 
     state["metrics"]["evaluation"] = evaluation
 

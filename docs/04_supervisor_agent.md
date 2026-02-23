@@ -2,17 +2,17 @@
 
 ## Role & Persona
 
-The Supervisor is the **"Brain"** of MASIS — the orchestration intelligence that decides what happens next at every cycle. It is the only node with the authority to trigger retries, escalate to a human, or finalize the answer. All other agents execute their tasks and return state; the Supervisor reads that state and makes routing decisions.
+The Supervisor is the **"Brain"** of MASIS — the orchestration intelligence that decides what happens next at every cycle. It is the only node with authority to trigger retries, escalate to a human, or finalize. All other agents execute tasks and return state; the Supervisor reads that state and makes routing decisions.
 
-It is the first node the graph visits (entry point) and the last node before a routing decision is made. The graph always returns to the Supervisor after the Evaluator finishes.
+It is both the entry point and the post-evaluation router. The graph always returns to the Supervisor after the Evaluator finishes.
 
 ---
 
 ## What Problem Does It Solve?
 
-### Problem 1: No Intelligence in the Routing Layer
+### Problem 1: Simplistic Single-Signal Routing
 
-In a naive pipeline, routing would be a simple rule: "if confidence < threshold, retry." This ignores the variety of failure modes in a real system — invalid citations, conflicting evidence, over-compression, zero retrieval — each of which requires a different response.
+A naive pipeline routes on a single rule: "if confidence < threshold, retry." This ignores the variety of failure modes — invalid citations, conflicting evidence, over-compression, score-filtered retrieval — each requiring a different response.
 
 **How MASIS solves it — Multi-Signal Quality Assessment:**
 
@@ -25,33 +25,38 @@ quality_issue = (
 )
 ```
 
-The Supervisor aggregates four independent signals:
-
-1. **Confidence below threshold** (`0.75`): the penalized score from the Critic is below acceptable quality.
-2. **Citation issue**: the citation engine found references to non-existent chunk IDs.
-3. **Hallucination flag**: the LLM auditor identified semantically unsupported claims.
-4. **Critic retry flag**: the Critic's structured output explicitly recommends a retry.
-
-Any single signal is sufficient to trigger a quality issue. This ensures the system catches both subtle semantic failures (low confidence, hallucination) and hard structural failures (invalid citations).
+Four independent signals — any single one is sufficient to trigger a quality issue. This catches both subtle semantic failures (low confidence, hallucination) and hard structural failures (invalid citations, over-compression).
 
 ---
 
-### Problem 2: Immediate HITL for Conflicts — Wasted Retries
+### Problem 2: Confidence Threshold Too Strict for Broad Queries
 
-The original design escalated to a human immediately when conflicting evidence was found, before any retry was attempted. But conflicting evidence in a first-pass retrieval with 5 chunks might disappear with 10 chunks — the conflict could be a retrieval artifact, not a genuine document contradiction.
+The original threshold of `0.75` was calibrated for a world without score filtering in the Researcher. With the score filter now preventing weak evidence from entering the pipeline, answers produced on qualifying evidence are better grounded. Setting 0.75 as the bar still flagged well-grounded broad-query answers.
+
+**How MASIS solves it — Lowered Threshold to 0.65:**
+
+```python
+LOW_CONF_THRESHOLD = 0.65
+```
+
+0.65 is appropriate when upstream retrieval quality is guaranteed by the score filter. The system is now less likely to retry a good answer simply because it covered a broad topic. If you increase `MIN_SCORE_THRESHOLD` in the Researcher, you can correspondingly raise `LOW_CONF_THRESHOLD` here — these two values are coupled.
+
+---
+
+### Problem 3: Immediate HITL for Conflicts — Wasted Retries
+
+The original design escalated to a human immediately when conflicting evidence was found. But conflicting evidence in a first-pass retrieval with 10 chunks might disappear with 20 chunks — the conflict could be a retrieval artefact, not a genuine document contradiction.
 
 **How MASIS solves it — Retry-First Conflict Resolution:**
 
 ```python
 if (quality_issue or has_conflicts) and retry_count < max_retries:
     state["retry_count"] = retry_count + 1
-    reason = "quality_issue_detected"
-    if has_conflicts and not quality_issue:
-        reason = "conflicting_evidence_attempting_resolution"
+    reason = "conflicting_evidence_attempting_resolution" if has_conflicts and not quality_issue else "quality_issue_detected"
     ...
     return state
 
-# Only escalate conflict to human AFTER retries are exhausted
+# Only escalate to human AFTER retries are exhausted
 if has_conflicts and retry_count >= max_retries:
     state["requires_human_review"] = True
     state["clarification_question"] = (
@@ -60,38 +65,32 @@ if has_conflicts and retry_count >= max_retries:
     )
 ```
 
-Conflicts now trigger a retry first (with an augmented query), giving the Researcher a chance to find disambiguating evidence. Only after all retries are exhausted without resolution is the conflict escalated to the human. This directly addresses the case study's requirement: *"How does the system resolve conflicting evidence between multiple documents?"* — the answer is: it tries to resolve it autonomously before asking for help.
+Conflicts now trigger a retry first (augmented query, broader retrieval). Only after all retries are exhausted without resolution is the conflict escalated to the human. The system tries to resolve ambiguity autonomously before asking for help.
 
 ---
 
-### Problem 3: The First-Run Bypass Problem
+### Problem 4: The First-Run Bypass Problem
 
-The Supervisor is both the entry point and the post-evaluation router. On the very first call, no draft answer exists yet. If the Supervisor ran its full decision logic on an empty state, it would see `confidence = 0.0`, classify it as a quality issue, increment `retry_count`, and enter a retry loop before even generating a first answer.
+The Supervisor is both the entry point and the post-evaluation router. On the very first call, no draft answer exists. If the Supervisor ran full decision logic on an empty state, it would see `confidence = 0.0`, classify it as a quality issue, increment `retry_count`, and enter a retry loop before generating a first answer.
 
 **How MASIS solves it — First-Run Guard:**
 
 ```python
-def supervisor_node(state: MASISState) -> MASISState:
-    _init_metrics(state)
-    
-    # First call — no answer yet, pass through to start the pipeline
-    if state.get("draft_answer") is None:
-        return state
+if state.get("draft_answer") is None:
+    return state
 ```
 
-The very first check is whether `draft_answer` is `None`. If it is, the Supervisor returns immediately without any routing logic. The graph's `route_from_supervisor` function then sees `draft_answer is None` and routes to `first_run → researcher`, starting the pipeline. The Supervisor's decision logic only activates after at least one full pipeline cycle has completed.
+The first check is whether `draft_answer` is `None`. If it is, the Supervisor returns immediately without any routing logic. The router then detects `draft_answer is None` and routes to `first_run → researcher`.
 
 ---
 
-### Problem 4: Ambiguous HITL Messaging
+### Problem 5: Ambiguous HITL Messaging
 
-When a human is asked to intervene, they need to understand exactly why — and what to do. A generic "the system needs help" message is useless. Different failure modes need different instructions.
+A generic "the system needs help" message gives the user no actionable guidance. Different failure modes need different instructions.
 
 **How MASIS solves it — Contextual HITL Messages:**
 
-Three distinct HITL scenarios each produce a tailored message:
-
-**Conflict HITL** (documents disagree):
+**Conflict HITL** (documents disagree, retries exhausted):
 ```
 "Conflicting information was detected across documents and could not be
 automatically resolved after multiple attempts. Please review the competing
@@ -104,27 +103,44 @@ f"After {max_retries} refinement attempts, confidence remains {confidence}%.
 You may refine your query or upload additional evidence."
 ```
 
-**Zero-results HITL** (set by Researcher, surfaced by routing):
+**Zero-results HITL** (set by Researcher, different message for filtered vs. empty):
 ```
-"No relevant documents were found for your query in this workspace.
-Please upload relevant documents or refine your question."
+"Your query did not match any documents with sufficient relevance. Try
+rephrasing with more specific terms from your documents, or upload documents
+that cover this topic."
 ```
 
-Each message tells the user what happened, what was attempted, and what action to take.
+Each message identifies what happened and what to do.
 
 ---
 
-### Problem 5: `max_retries` Could Be `None`
+### Problem 6: Retry Reasoning Is Opaque
 
-If a caller passes `max_retries=None` explicitly in the state, a comparison like `retry_count < max_retries` raises a `TypeError`. Since `max_retries` comes from user-controlled input, this is a real attack surface.
+Previously the retry decision was logged but without structured reasoning for why it was made, making monitoring and debugging harder.
 
-**How MASIS solves it — Defensive Fallback:**
+**How MASIS solves it — Structured Retry Reasons Telemetry:**
+
+```python
+state["metrics"]["retry_reasons"].append({
+    "iteration": retry_count + 1,
+    "confidence": confidence,
+    "reason": reason,
+    "citation_issue": citation_issue,
+    "hallucination": hallucination_flag,
+})
+```
+
+Every retry decision is logged with the specific signals that triggered it, the confidence at that point, and the iteration number. In production this enables queries like "show me all requests where the retry reason was citation_issue" — enabling targeted improvements.
+
+---
+
+### Problem 7: `max_retries` Could Be `None`
 
 ```python
 max_retries = state.get("max_retries") or 2
 ```
 
-Using `or 2` instead of `state.get("max_retries", 2)` handles both the missing-key case and the explicit-`None` case. If `max_retries` is `None`, `0`, or absent, the fallback of `2` is used.
+Using `or 2` handles both missing key and explicit `None`. A comparison `retry_count < None` would raise `TypeError`.
 
 ---
 
@@ -138,7 +154,7 @@ Supervisor Called
 │
 ├── quality_issue OR has_conflicts?
 │   ├── AND retry_count < max_retries
-│   │   └── increment retry_count → return (route: retry → researcher)
+│   │   └── increment retry_count, log retry_reason → return (route: retry → researcher)
 │   │
 │   └── AND retry_count >= max_retries
 │       ├── has_conflicts → HITL (conflict message) → return (route: end)
@@ -153,15 +169,16 @@ Supervisor Called
 
 | Field | Direction | Description |
 |---|---|---|
-| `draft_answer` | Input | Used to detect first-run vs. post-cycle |
-| `critique` | Input | Confidence, hallucination flag, conflicts, retry flag |
-| `retry_count` | Input | Current iteration count |
+| `draft_answer` | Input | Detects first-run vs. post-cycle |
+| `critique` | Input | Confidence, hallucination, conflicts, retry flag |
+| `retry_count` | Input | Current iteration |
 | `max_retries` | Input | Ceiling for retry attempts |
 | `metrics.citation_violations` | Input | Latest citation engine findings |
-| `retry_count` | **Output** | Incremented if retry decision made |
-| `requires_human_review` | **Output** | Set to `True` on HITL decision |
-| `clarification_question` | **Output** | Human-readable HITL message |
-| `trace` | **Output** | Appended decision entry |
+| `retry_count` | **Output** | Incremented on retry |
+| `requires_human_review` | **Output** | Set `True` on HITL |
+| `clarification_question` | **Output** | Contextual HITL message |
+| `metrics.retry_reasons` | **Output** | Structured log of every retry decision |
+| `trace` | **Output** | Decision entry |
 
 ---
 
@@ -202,10 +219,10 @@ Supervisor Called
 
 ## Why the Supervisor Is Not an LLM
 
-This is a deliberate design choice worth being explicit about. The Supervisor uses **pure Python logic** — no LLM call, no prompt, no structured output. This gives it three critical properties:
+Pure Python logic — no LLM call. This gives:
 
-1. **Determinism**: The same state always produces the same routing decision. No temperature, no randomness, no mood.
-2. **Speed**: No API call, no latency. The routing decision is microseconds, not seconds.
-3. **Debuggability**: Every decision is traceable to a specific condition in code. When auditing why the system retried or escalated, you look at the state values, not at an LLM's opaque reasoning.
+1. **Determinism** — the same state always produces the same routing decision.
+2. **Speed** — microseconds, not seconds.
+3. **Debuggability** — every decision traces to a specific condition. No LLM opacity.
 
-The case study asks about "Systemic Thinking" — this is the architectural answer: routing logic should be code, not language model inference.
+Routing logic is code, not language model inference.

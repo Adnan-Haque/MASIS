@@ -1,6 +1,6 @@
 # 🎯 Interview Questions — MASIS Deep Dive Preparation
 
-Questions are drawn from the case study's "Curveball Questions" and "Deep-Dive Design Questions" sections, plus additional questions likely to be asked based on the architecture. Each includes a model answer grounded in the actual implementation.
+Questions drawn from the case study's curveball and deep-dive sections, updated to reflect the current implementation including the score threshold filter, adaptive retrieval, proportional penalties, citation audit injection, and the lowered confidence threshold.
 
 ---
 
@@ -8,80 +8,73 @@ Questions are drawn from the case study's "Curveball Questions" and "Deep-Dive D
 
 ---
 
-**Q1. Walk me through your orchestration strategy. Why did you choose a Supervisor-controlled DAG over a sequential chain or a fully autonomous multi-agent loop?**
+**Q1. Walk me through your orchestration strategy. Why a Supervisor-controlled DAG over a sequential chain or fully autonomous loop?**
 
-A sequential chain (A→B→C→END) cannot express feedback loops — if C's output is poor, the chain can't go back to A with improved context. A fully autonomous loop (where agents decide their own next steps) is unpredictable and hard to debug — you can't guarantee termination or control which agent acts next.
+A sequential chain (A→B→C→END) cannot express feedback loops. A fully autonomous loop (agents decide their own next steps) is unpredictable and can't guarantee termination.
 
-MASIS uses a **Supervisor-controlled DAG**: the inner pipeline (Researcher→Synthesizer→Critic→Evaluator) is a fixed linear chain, and the only conditional logic lives in the Supervisor. This means:
+MASIS uses a **Supervisor-controlled DAG**: the inner pipeline (Researcher→Synthesizer→Critic→Evaluator) is a fixed linear chain. All conditional logic lives in the Supervisor. This means:
 - The inner pipeline is always predictable and testable in isolation.
-- All routing intelligence is in one place — the Supervisor — making the system's decision logic easy to audit, modify, and explain.
-- Termination is guaranteed by the `max_retries` ceiling, which is impossible to enforce in a fully autonomous loop.
+- All routing intelligence is in one place — easy to audit, modify, explain.
+- Termination is guaranteed by `max_retries` — impossible to enforce in a fully autonomous loop.
 
 ---
 
-**Q2. What happens if the Researcher agent enters an infinite search loop?**
+**Q2. What happens if the Researcher enters an infinite search loop?**
 
-It can't, by design. The Researcher is a node in a controlled graph — it executes once per cycle and returns. It has no internal loop. The cycle itself is bounded by `max_retries` in the Supervisor. Even if Qdrant were infinitely slow, the Researcher would just block until it returned or timed out — it doesn't loop.
+It cannot, by design. The Researcher is a node that executes once per cycle and returns. The cycle is bounded by `max_retries` in the Supervisor. After 2 retries the Supervisor always escalates to HITL → END.
 
-If the concern is about the graph cycling infinitely (Supervisor always deciding "retry"), that's prevented by the `retry_count < max_retries` guard. After 2 retries (configurable), the Supervisor always escalates to HITL, which routes to END.
-
-For production hardening, I'd add a per-node timeout wrapper and a circuit breaker on the Qdrant client — if the vector DB is unresponsive after N milliseconds, fail fast and surface a HITL message rather than hanging.
+Additionally, if Qdrant returns candidates that all fail the score threshold filter (`MIN_SCORE_THRESHOLD = 0.60`), the Researcher sets `requires_human_review = True` immediately — exiting to END without any retry cycle starting. The graph cannot loop on a workspace with no qualifying evidence.
 
 ---
 
-**Q3. How do you prevent agentic drift, where sub-tasks diverge from the original user intent?**
+**Q3. How do you prevent agentic drift — sub-tasks diverging from original user intent?**
 
-Several mechanisms:
-
-1. **`user_query` is immutable in state** — it's set at init and never overwritten. Every node that generates content receives the original query, not a reformulated version.
-2. **Critique-aware augmentation is additive** — on retry, the Researcher appends gap terms to the original query (`augmented_query = query + " " + focus_terms`). The original intent is preserved; only the search scope is widened.
-3. **The Synthesizer always receives the original question** — even on retry 2, the synthesis prompt starts with the user's exact question.
-4. **The Evaluator scores Relevance** — it explicitly checks whether the final answer addresses the user's question. Low relevance scores would surface in monitoring.
-5. **The Supervisor's routing is query-agnostic** — it never reformulates the goal, only decides whether quality is sufficient.
+1. **`user_query` is immutable** — set at init, never overwritten. Every node receives the original query.
+2. **Augmentation is additive** — on retry, focus terms are appended to the original: `augmented_query = query + " " + focus_terms`. Intent is preserved; only search scope is widened.
+3. **Synthesizer always receives the original question** — even on retry 2.
+4. **Evaluator scores Relevance** — explicitly checks whether the final answer addresses the original question. Low scores surface in monitoring.
+5. **Supervisor routing is query-agnostic** — never reformulates the goal.
 
 ---
 
-**Q4. With 10,000 documents, how do you avoid losing critical context in the middle of the prompt?**
+**Q4. With 10,000 documents, how do you avoid losing critical context?**
 
 Three layers:
 
-**Layer 1 — Selective retrieval.** Qdrant returns only the top-K most relevant chunks (5 on first run, 10 on retry) — not all 10,000 documents. The vector search narrows the haystack to the most relevant handful.
+**Layer 1 — Score-filtered retrieval.** Qdrant returns up to 20 candidates (on retry), but only those scoring ≥ 0.60 cosine similarity pass to the Synthesizer. This narrows the haystack to genuinely relevant chunks, not just the "closest" ones.
 
-**Layer 2 — Relevance-ranked compression.** If those chunks still exceed 6,000 characters, the Synthesizer sorts them by score and keeps the top 3 full. Lower-ranked chunks are compressed to 200 characters each. This means the highest-relevance content is never degraded.
+**Layer 2 — Relevance-ranked compression.** If surviving chunks exceed 6,000 characters, the Synthesizer sorts by score, keeps the top 3 full, and compresses the rest to 200 characters each. Highest-value evidence is never degraded.
 
-**Layer 3 — Position-aware assembly.** After compression, chunks are assembled with the highest-scoring ones first. LLMs perform best on content at the beginning and end of prompts — so the most critical evidence is positioned where attention is strongest.
+**Layer 3 — Position-aware assembly.** After compression, highest-scoring chunks appear first. LLMs perform best on content at the beginning of prompts.
 
-In a further production improvement, I'd add MMR (Maximal Marginal Relevance) to diversify retrieved chunks — rather than 5 near-identical chunks about the same paragraph, get 5 chunks covering different aspects of the topic.
+Production improvement: add MMR (Maximal Marginal Relevance) to diversify retrieved chunks — rather than 5 near-identical chunks about the same paragraph, get 5 covering different aspects.
 
 ---
 
-**Q5. How does the system handle conflicting evidence between Document A and Document B?**
+**Q5. How does the system handle conflicting evidence between documents?**
 
-The Critic's LLM audit is specifically prompted to identify `conflicting_evidence` — a list of statements where two retrieved chunks make opposing claims. When this is detected:
+1. **First** the Supervisor triggers a retry with augmented query and expanded retrieval (20 candidates vs. 10). The Researcher may surface chunks that clarify which source is authoritative.
 
-1. **First**, the Supervisor triggers a retry with the augmented query. The Researcher may surface additional chunks that clarify which source is authoritative (e.g., one document is more recent, or a third document resolves the ambiguity).
+2. **If retries are exhausted and conflict persists**, the Supervisor sets `requires_human_review = True`:
+   *"Conflicting information was detected across documents and could not be automatically resolved. Please review the competing claims and select a preferred source."*
 
-2. **If retries are exhausted and conflict persists**, the Supervisor sets `requires_human_review = True` with the message: *"Conflicting information was detected across documents and could not be automatically resolved. Please review the competing claims and select a preferred source."*
+3. The frontend shows the best draft alongside the conflict warning and the full quality assessment panel — including the Evaluator's faithfulness score, which will be low due to citation audit findings.
 
-3. The human response can then be fed back as a preference signal in a follow-up request (e.g., "Use Document B's figure").
-
-We deliberately chose not to auto-resolve conflicts by picking the higher-confidence source — in a strategic intelligence system, silently choosing one source over another without human knowledge could be more dangerous than surfacing the conflict.
+We deliberately chose not to auto-resolve conflicts by picking the higher-confidence source — in a strategic intelligence system, silently choosing one source over another without human knowledge is more dangerous than surfacing the conflict.
 
 ---
 
 **Q6. Where would you swap GPT-4-class models for smaller SLMs?**
 
-Current model allocation:
+Current allocation:
 - `gpt-4o-mini` — Synthesizer (generation), compression (summarization)
 - `gpt-4o` — Critic (hallucination detection), Evaluator (quality scoring)
 
-The reasoning:
+**Keep large models for:** Critic must detect subtle semantic hallucinations and calibrate structured confidence scores. Evaluator must apply nuanced scoring rubrics and honour hard constraints on faithfulness. Both require deep reasoning.
 
-**Keep large model for:** Tasks requiring deep reasoning — the Critic must detect subtle semantic hallucinations, logical gaps, and conflicting claims. A smaller model is more likely to miss these. The Evaluator similarly requires calibrated, nuanced scoring.
+**Use small model for:** Synthesizer follows explicit instructions ("cite every claim, hedge when evidence is partial") on well-scoped content — a pattern-following task, not deep reasoning. `gpt-4o-mini` costs ~15-20x less and is fully capable. Compression (summarize to 200 chars, preserve numbers) is even simpler.
 
-**Use smaller model for:** The Synthesizer is following explicit instructions ("cite every claim") on well-scoped content. This is a pattern-following task, not a deep-reasoning task. `gpt-4o-mini` is capable of it and costs ~15-20x less. Compression is even simpler — summarize each chunk in 200 chars — clearly within mini's capability.
-
-**Future swap:** If I were deploying at higher volume, I'd test using a fine-tuned `gpt-3.5` or `Mistral-7B` for the Synthesizer, since it's doing a constrained, repetitive task. The Critic and Evaluator I would not compromise.
+**Future swap:** Test a fine-tuned `Mistral-7B` for the Synthesizer at scale. Keep `gpt-4o` for Critic and Evaluator.
 
 ---
 
@@ -89,63 +82,63 @@ The reasoning:
 
 ---
 
-**Q7. Your Researcher only does semantic search. How would you extend it to hybrid retrieval?**
+**Q7. You added a score threshold filter. How did you calibrate 0.60 and what are the tradeoffs?**
 
-Currently: `embeddings.embed_query(query)` + Qdrant vector search.
+0.60 cosine similarity with OpenAI's `text-embedding-ada-002` is a pragmatic baseline — in practice, chunks below this threshold are semantically too distant from the query to produce useful citations. Above it, chunks are reliably topically related.
 
-To add hybrid retrieval:
+Tradeoffs:
+- **Too high (e.g., 0.75):** Even well-phrased queries may return no qualifying evidence. Frequent HITL escalations for answerable questions.
+- **Too low (e.g., 0.45):** Weak evidence passes through, vague answers, low confidence — the original problem.
+
+The threshold is adaptive: drops to 0.55 on retry because the augmented query is more specific. What scored 0.57 on the original query may be highly relevant to the augmented terms.
+
+In production I'd tune this per-workspace or per-document-type using offline evaluation: run a set of known-answerable queries and find the threshold where recall stays high while precision doesn't collapse.
+
+---
+
+**Q8. Your Researcher does semantic search only. How would you extend to hybrid retrieval?**
 
 ```python
 # Semantic leg (existing)
+dense_vector = embeddings.embed_query(augmented_query)
 semantic_results = qdrant_client.search(
-    collection_name="masis_documents",
-    query_vector=("dense", dense_vector),
-    limit=limit,
-    ...
+    query_vector=("dense", dense_vector), limit=limit, ...
 )
 
-# Keyword leg (BM25 / sparse vectors)
+# Keyword leg (new — BM25 sparse vectors)
 sparse_results = qdrant_client.search(
-    collection_name="masis_documents", 
-    query_vector=("sparse", sparse_vector),  # using SPLADE or BM25 sparse encoder
-    limit=limit,
-    ...
+    query_vector=("sparse", sparse_vector),  # SPLADE or BM25 encoder
+    limit=limit, ...
 )
 
-# Fusion with Reciprocal Rank Fusion
+# Fusion
 final_results = reciprocal_rank_fusion(semantic_results, sparse_results)
 ```
 
-Keyword search catches exact-match terms (product names, codes, dates) that semantic search may miss. Semantic search catches conceptually related content where exact words differ. Hybrid is almost always better than either alone.
-
-Qdrant natively supports both dense and sparse vectors in a single collection and can run hybrid queries with RRF fusion. The case study explicitly lists "hybrid approaches" as a retrieval strategy — this is the implementation answer.
+Keyword search catches exact-match terms (product names, codes, dates) that semantic search misses. Semantic search catches conceptually related content where exact words differ. Hybrid is almost always better than either alone. Qdrant natively supports both dense and sparse vectors in a single collection with RRF fusion.
 
 ---
 
-**Q8. How do you ensure repeated queries produce stable, consistent conclusions?**
+**Q9. How do you ensure repeated queries produce stable, consistent conclusions?**
 
-Several strategies:
+1. **Score threshold filter** — same query always retrieves the same qualifying chunks (Qdrant's ANN is deterministic for the same index state).
+2. **Temperature = 0 on compression LLM** — compression is deterministic.
+3. **Structured output via function calling** — Critic and Evaluator use `.with_structured_output()`, significantly reducing variance vs. free-form generation.
+4. **Deterministic routing** — Supervisor uses pure Python. Same state → same decision.
+5. **Proportional penalty** — Critic's confidence penalty is deterministic code, not LLM output.
 
-1. **Temperature = 0 on compression LLM** — compression is deterministic.
-2. **Structured output via function calling** — the Critic and Evaluator use `.with_structured_output()` which forces outputs through OpenAI's function-calling mechanism, significantly reducing variance compared to free-form generation.
-3. **Deterministic routing** — the Supervisor uses pure Python logic (no LLM), so the same state always produces the same routing decision.
-4. **Seeded embeddings** — OpenAI embeddings are deterministic for the same input, so the same query always retrieves the same chunks from the same Qdrant state.
-
-The main source of variance is the Synthesizer and Critic LLM calls, which don't have `temperature=0`. For production consistency, I'd set `temperature=0` on both and evaluate whether output quality degrades. Often it doesn't for constrained tasks like citation-grounded synthesis.
+Main variance source: Synthesizer and Critic LLM calls at non-zero temperature. For production consistency I'd set `temperature=0` on both and evaluate quality impact.
 
 ---
 
-**Q9. How do you handle the "lost-in-the-middle" problem for 50 retrieved chunks?**
+**Q10. How does the "lost-in-the-middle" problem apply here?**
 
-The Synthesizer's compression step addresses this directly. With 50 chunks:
-- Top 3 by score: full text (highest attention, highest relevance)
-- Chunks 4–50: compressed to ~200 chars each (preserves key numbers/metrics, removes padding)
+With the score filter retaining only high-quality chunks, and the compression step keeping top 3 full + compressing the rest, the highest-relevance content is always at the front of the context — where LLM attention is strongest. The lost-in-the-middle problem primarily affects systems that dump 50+ chunks into a prompt indiscriminately. MASIS's two-stage filtering (score threshold + compression ranking) prevents that.
 
-The resulting context is roughly `3 × 800 + 47 × 200 = 11,800 chars` — still significant but manageable. For even larger contexts, I'd add:
-
-1. **Re-ranking**: After initial retrieval, run a cross-encoder re-ranker (e.g., `cross-encoder/ms-marco-MiniLM-L-6-v2`) to get more accurate relevance scores than the initial embedding similarity. The top-K after re-ranking are more reliably the most relevant.
-2. **Recursive summarisation**: For very long documents, chunk → summarise → embed the summaries instead of raw text.
-3. **Map-reduce synthesis**: Split the 50 chunks into groups of 5, synthesise each group separately, then synthesise the partial answers. This keeps each individual LLM call's context manageable.
+For very large document corpora I'd add:
+1. **Re-ranking** — cross-encoder (e.g., `ms-marco-MiniLM-L-6-v2`) after initial retrieval for more accurate relevance scores.
+2. **Recursive summarisation** — for very long documents, chunk → summarise → embed summaries.
+3. **Map-reduce synthesis** — split chunks into groups, synthesise each, then synthesise the partial answers.
 
 ---
 
@@ -153,33 +146,35 @@ The resulting context is roughly `3 × 800 + 47 × 200 = 11,800 chars` — still
 
 ---
 
-**Q10. Why is your graph state a TypedDict and not a Pydantic BaseModel?**
+**Q11. Why is graph state a TypedDict and not a Pydantic BaseModel?**
 
-This was a real bug we hit. LangGraph's `StateGraph` requires dict-style access internally — nodes must use `state["key"]` and `state.get("key")`, not `state.field`. Pydantic `BaseModel` uses attribute access (`state.field`) and raises `AttributeError` when you try `state.get()`.
+Real bug encountered. LangGraph's `StateGraph` requires dict-style access internally — nodes must use `state["key"]` and `state.get("key")`. Pydantic `BaseModel` uses attribute access (`state.field`) and raises `AttributeError` when you try `state.get()`.
 
 `TypedDict` gives:
-- Dict-style access (compatible with LangGraph internals)
-- Type hints (for IDE support and documentation)
-- `total=False` (all fields optional, suitable for a state object that evolves through the pipeline)
+- Dict-style access (compatible with LangGraph)
+- Type hints (IDE support)
+- `total=False` (all fields optional — correct for a state object that evolves through the pipeline)
 
-The API boundary uses `MASISInput` (a Pydantic `BaseModel`) for input validation, converted to `MASISState` via `.to_state()`. Validation at the boundary, TypedDict inside the graph. Clean separation.
-
----
-
-**Q11. How is state shared between agents? How do you prevent uncontrolled context growth?**
-
-State is a single shared `MASISState` dict passed through every node by LangGraph. Each node mutates it and returns it — LangGraph merges the result back into the running state.
-
-Context growth is prevented at the prompt level, not the state level:
-- The state stores full `EvidenceChunk` objects (necessary for the citation engine to validate IDs).
-- The **prompts** use compressed text, not the full chunk text.
-- The Synthesizer decides what goes into the LLM's context window; the state just stores the raw evidence.
-
-If state growth itself became a concern (e.g., `trace` growing very large over many retries), I'd add a state trimming step in the Supervisor that keeps only the last N trace entries.
+API boundary uses `MASISInput` (Pydantic `BaseModel`) for validation, converted to `MASISState` via `.to_state()`. Validation at the edge, TypedDict inside the graph.
 
 ---
 
-**Q12. What's your rate limiting strategy, and why is it important in multi-agent systems?**
+**Q12. How is state shared between agents? How do you prevent uncontrolled context growth?**
+
+State is a single shared `MASISState` dict. Each node mutates and returns it — LangGraph merges the result back into the running state.
+
+Context growth is prevented at the **prompt level**, not the state level:
+- State stores full `EvidenceChunk` objects (necessary for the citation engine to validate IDs).
+- Prompts use compressed text when chunks exceed 6,000 characters.
+- The Synthesizer decides what enters the LLM's context window; the state stores raw evidence.
+
+New in current implementation: `last_citation_audit` in `metrics` — a compact structured dict (not the full evidence) passed from Critic to Evaluator. This keeps inter-node communication lightweight.
+
+If `trace` growth became a concern over many retries, I'd add a trimming step in the Supervisor keeping only the last N entries.
+
+---
+
+**Q13. What's your rate limiting strategy, and why does it matter in multi-agent systems?**
 
 ```python
 MAX_CALLS_PER_MINUTE = 10
@@ -195,11 +190,11 @@ def _rate_limit():
         _call_timestamps.append(time.time())
 ```
 
-A token bucket — tracks LLM call timestamps in a sliding window. If 10 calls have been made in the last 60 seconds, the next call blocks until the oldest drops off.
+Token bucket — sliding window over the last 60 seconds. If 10 calls have been made, the next call blocks until the oldest drops off.
 
-Why it matters in multi-agent systems: a single user request in MASIS can trigger 6–9 LLM calls (2 retry cycles × 3 agents). At scale, 10 concurrent users could generate 90 LLM calls/minute — easily hitting OpenAI's RPM limits and incurring 429 errors. Without rate limiting, the system degrades catastrophically under load. With it, requests are queued gracefully.
+Why it matters: a single MASIS request with 2 retries triggers up to 9 LLM calls (3 agents × 3 iterations). At scale, 10 concurrent users generate 90 LLM calls/minute — easily hitting OpenAI's RPM limits. Without rate limiting the system degrades catastrophically under load.
 
-In production, I'd move this to a Redis-backed distributed rate limiter (since multiple API server instances share the same OpenAI quota) and use exponential backoff on 429 responses.
+Production improvement: Redis-backed distributed rate limiter (multiple API server instances share the same OpenAI quota) + exponential backoff on 429 responses.
 
 ---
 
@@ -207,11 +202,11 @@ In production, I'd move this to a Redis-backed distributed rate limiter (since m
 
 ---
 
-**Q13. What's your fallback/retry strategy for sub-task failures? What if the Critic LLM call fails?**
+**Q14. What's your fallback strategy if the Critic LLM call fails?**
 
-Currently, if any LLM call throws an exception (network error, 500, rate limit), it propagates up and crashes the graph invocation. The caller gets a 500 error.
+Currently, any LLM exception propagates up and the graph invocation crashes → 500 error.
 
-A production hardening approach:
+Production hardening:
 
 ```python
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -221,55 +216,74 @@ def _invoke_with_retry(llm, prompt):
     return llm.invoke(prompt)
 ```
 
-Each LLM call gets wrapped with exponential backoff retry (3 attempts, 1–10 second waits). If all retries fail, the node raises an exception, the graph catches it, and a fallback response is returned to the user with a clear error message.
-
-For the Critic specifically: if it fails, the Supervisor could fall back to treating the draft as needing a retry (conservative default) rather than auto-approving it (which would be dangerous).
+Exponential backoff retry (3 attempts, 1–10 second waits). If all retries fail, the Critic raises, the graph catches it, and a fallback HITL response is returned. For the Critic specifically: failure defaults to treating the draft as needing retry (conservative) rather than auto-approving it (dangerous).
 
 ---
 
-**Q14. How would you monitor this system in production?**
+**Q15. How would you monitor this system in production?**
 
-Every state contains `state["metrics"]` and `state["trace"]` — these are the observability primitives. In production:
+Every response contains `metrics` and `trace` — the observability primitives.
 
-1. **Log the full state on every completion** — ship `metrics` and `trace` to a logging backend (CloudWatch, Datadog, etc.).
-2. **Alert on**: avg `confidence` dropping below threshold across a time window; `requires_human_review` rate spiking; evaluator `faithfulness` score declining; `node_latency_ms` exceeding SLAs.
-3. **Dashboard**: confidence distribution histogram, retry rate over time, HITL escalation rate by workspace, per-node latency percentiles.
-4. **Traces**: each `trace` entry is a structured log event — can be stored in an OLAP system and queried to understand why specific queries failed.
+1. **Log the full state** on every completion — ship to CloudWatch/Datadog.
+2. **Alert on**: confidence dropping below threshold across a time window; `requires_human_review` rate spiking; evaluator `faithfulness` declining; `filtered_out` rate rising (indicates query patterns are drifting from document content); `node_latency_ms` exceeding SLAs.
+3. **Dashboard**: confidence distribution histogram; retry rate over time; HITL rate by workspace; `filtered_out` rate by workspace (workspace-level retrieval health signal); per-node latency percentiles.
+4. **`retry_reasons` aggregation**: which signals (citation_issue, hallucination, low_confidence) most frequently trigger retries — guides where to invest improvement effort.
 
 ---
 
-**Q15. How would you test individual agents in isolation?**
+**Q16. How would you test individual agents in isolation?**
 
-Each node is a plain Python function `(MASISState) -> MASISState`. To test:
+Each node is a plain Python function `(MASISState) -> MASISState`. No graph invocation needed:
 
 ```python
-def test_critic_node_flags_invalid_citation():
+def test_researcher_score_filter():
+    # Simulate Qdrant returning weak results
+    # ... mock qdrant_client.search to return results with score 0.50
     state = {
-        "draft_answer": "Revenue grew [chunk_999].",  # chunk_999 doesn't exist
-        "evidence": [EvidenceChunk(chunk_id="chunk_1", ...)],
+        "user_query": "NovaTech findings",
+        "workspace_id": "test-ws",
         "retry_count": 0,
         "metrics": {},
-        "trace": []
+        "trace": [],
+        "critique": {}
+    }
+    result = researcher_node(state)
+    # All results below 0.60 should be filtered
+    assert result["requires_human_review"] == True
+    assert result["trace"][-1]["warning"] == "no_qualifying_evidence"
+    assert result["trace"][-1]["results_before_filter"] == 3
+
+def test_critic_proportional_penalty():
+    # 4 uncited claims → 4 * 0.03 = 12% penalty
+    state = {
+        "draft_answer": "Claim one. Claim two. Claim three. Claim four.",
+        "evidence": [EvidenceChunk(chunk_id="c1", ...)],
+        "retry_count": 0, "metrics": {}, "trace": []
     }
     result = critic_node(state)
-    
-    assert result["critique"]["hallucination_detected"] == True
-    assert result["critique"]["needs_retry"] == True
-    assert result["confidence"] < 0.5
+    # LLM confidence say 0.80 → penalty 0.88 → final ~0.70
+    assert result["confidence"] < 0.80
+    assert result["metrics"]["citation_violations"][-1]["uncited_claims"] == 4
+
+def test_evaluator_hard_clamp():
+    # Hallucination detected → faithfulness must be <= 0.4 regardless of LLM score
+    state = {
+        "user_query": "...", "final_answer": "...", "evidence": [...],
+        "metrics": {
+            "last_citation_audit": {
+                "invalid_citations": ["fake_id"],
+                "uncited_claim_count": 2,
+                "hallucination_detected": True,
+                "unsupported_claims": []
+            }
+        },
+        "trace": []
+    }
+    result = evaluator_node(state)
+    assert result["metrics"]["evaluation"]["faithfulness"] <= 0.4
 ```
 
-No graph invocation needed. Each node can be unit-tested with a crafted state dict. The deterministic citation engine parts can be tested without any LLM mock. The LLM-dependent parts use `unittest.mock.patch` to mock `critic_llm.invoke()`.
-
----
-
-**Q16. How would you handle a 10x scale increase in document uploads?**
-
-The bottleneck is Qdrant retrieval latency and embedding generation. Strategies:
-
-1. **Qdrant horizontal scaling** — Qdrant supports distributed clusters. Shard the `masis_documents` collection across nodes by `workspace_id`.
-2. **Async embedding** — move document ingestion (chunking + embedding + upsert) to a background job queue (Celery, SQS). Don't block the upload endpoint on embedding.
-3. **Embedding cache** — cache query embeddings for frequently-asked questions (Redis + LRU). The same query embedding is reused across users asking the same question.
-4. **Pre-filtering at index time** — add more metadata to chunks (document date, section type, author) to enable tighter pre-filters, reducing the search space per query.
+Deterministic parts (score filter, citation engine, clamp logic) require no LLM mock. LLM-dependent parts use `unittest.mock.patch` on the LLM invoke.
 
 ---
 
@@ -277,36 +291,60 @@ The bottleneck is Qdrant retrieval latency and embedding generation. Strategies:
 
 ---
 
-**Q17. The Synthesizer said "I cannot provide information on this topic" — why might that happen and how would you fix it?**
+**Q17. A simple query like "what are the findings of NovaTech" gets low confidence. Why and how did you fix it?**
 
-The prompt includes: *"If there is insufficient evidence, explicitly state so."* If Qdrant returns chunks that are tangentially related but don't actually contain the answer, the Synthesizer (correctly) refuses to fabricate. This is working as designed.
+The word "findings" doesn't appear in the documents. The embedding of "findings of NovaTech" points to a semantic space that returns chunks with cosine similarity around 0.51–0.55 — below the `MIN_SCORE_THRESHOLD` of 0.60. All candidates are filtered out. The Researcher sets HITL immediately with the message: *"Your query did not match any documents with sufficient relevance. Try rephrasing with more specific terms."*
 
-Fix depends on root cause:
-- If the documents genuinely don't contain the answer → HITL is the right outcome.
-- If the retrieval failed to surface the right chunks → the retry with augmented query should find them.
-- If the query is too specific for the chunking granularity → improve the chunking strategy (smaller chunks, overlapping windows).
+The fix has two parts:
+1. **User guidance**: the HITL message now explicitly tells the user to rephrase with specific terms from their documents.
+2. **Correct query**: *"What are the key financial results and business performance highlights of NovaTech in FY2023?"* — these words appear directly in the documents and return high-scoring chunks.
+
+This is working as designed. A query that doesn't match the document vocabulary shouldn't produce a confident answer. The system correctly refuses rather than generating vague, low-cited content.
 
 ---
 
-**Q18. What if two agents disagree — the Critic says confidence is high but the citation engine finds invalid citations?**
+**Q18. What if two agents disagree — Critic says confidence is high but citation engine finds invalid IDs?**
 
-This is explicitly handled. The Critic's LLM-reported confidence is treated as an input, then **overridden** by the citation engine's deterministic findings:
+Deterministic code beats LLM self-assessment. Always.
 
 ```python
 if invalid_citations:
     critique["hallucination_detected"] = True  # overrides LLM's assessment
     critique["needs_retry"] = True
-    penalty_factor *= 0.5                       # hard penalty on confidence
+    penalty_factor *= 0.5
 ```
 
-The deterministic check beats the LLM's self-assessment. If the code finds a fake citation, that's a fact — the LLM is wrong. This is an intentional architectural decision: hard evidence (code-verified) always overrides soft evidence (LLM reasoning).
+If the code finds a fake citation, that's a fact — regardless of what the LLM thinks. The Evaluator then receives this via `last_citation_audit` and its faithfulness is hard-clamped to ≤ 0.40 by code, even if the LLM tried to assign 0.85. Two layers of deterministic override: the Critic's penalty, and the Evaluator's clamp.
 
 ---
 
-**Q19. How does your system perform if the vector database goes down?**
+**Q19. The Evaluator returned faithfulness = 0.40 even though the LLM wanted to give 0.85. Why?**
 
-Currently: the Researcher's `qdrant_client.search()` call would throw an exception, crashing the graph. The user gets a 500.
+The Critic's citation engine found invalid chunk IDs in the answer — references to chunk IDs that don't exist in the retrieved evidence. This is a confirmed hallucination. The Critic stored this in `last_citation_audit`. The Evaluator received it as a hard constraint: `"If invalid citations exist, Faithfulness MUST be <= 0.4"`. After the LLM responded with 0.85, the code clamped it to 0.40 and recalculated the overall score using the weighted mean. The code's deterministic finding took precedence over the LLM's subjective assessment.
 
-Production fix: wrap the Qdrant call in a try/except, catch `QdrantException` or `ConnectionError`, set `requires_human_review = True` with message "Document retrieval is temporarily unavailable. Please try again shortly." The graph then routes to END gracefully.
+---
 
-Longer term: a circuit breaker that opens after N consecutive Qdrant failures, failing fast on all subsequent requests until the DB recovers, rather than waiting for each request to time out individually.
+**Q20. How does your system perform if the vector database goes down?**
+
+Currently: `qdrant_client.search()` throws an exception → graph crashes → 500 error.
+
+Production fix:
+
+```python
+try:
+    results = qdrant_client.search(...)
+except Exception as e:
+    state["requires_human_review"] = True
+    state["clarification_question"] = "Document retrieval is temporarily unavailable. Please try again shortly."
+    state["trace"].append({"node": "researcher", "warning": "qdrant_unavailable", "error": str(e)})
+    state["evidence"] = []
+    return state
+```
+
+Longer term: a circuit breaker that opens after N consecutive Qdrant failures, failing fast on all subsequent requests rather than waiting for each to time out individually. This is the production improvement I'd mention in interview even though it's not in the current implementation.
+
+---
+
+**Q21. How does the confidence history tell you whether retries are actually helping?**
+
+`state["metrics"]["confidence_history"]` appends the Critic's penalized confidence after each iteration. If it looks like `[0.54, 0.71, 0.88]`, retries are working — each cycle is finding better evidence and producing better-cited answers. If it looks like `[0.54, 0.55, 0.53]`, retries aren't helping — the documents probably don't contain the answer, and the system should escalate to HITL faster rather than wasting API calls. In production, monitoring this pattern per workspace would tell you which workspaces have inadequate document coverage for their query patterns.

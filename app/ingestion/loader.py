@@ -7,13 +7,22 @@ from app.ingestion.vision_processor import process_image_with_vision
 
 logger = logging.getLogger(__name__)
 
-MAX_CHARS = 1500  # safe embedding size
+MAX_CHARS = 1500      # safe embedding size
+OVERLAP_CHARS = 200   # chars carried from end of previous chunk into next
 
 
 def split_large_text(text, chunk_type="text"):
     """
-    Generic fallback splitter for large text blobs.
-    Splits by paragraph first, then size.
+    Split text into overlapping chunks of MAX_CHARS.
+
+    CHANGE vs original:
+    - After yielding a chunk, the last OVERLAP_CHARS of that chunk
+      are prepended to the next chunk's buffer.
+    - This ensures sentences/figures that straddle a chunk boundary
+      appear in BOTH adjacent chunks, so retrieval can find them
+      regardless of which chunk is returned.
+    - Everything else (paragraph splitting logic, yield structure,
+      chunk dict shape) is identical to the original.
     """
     paragraphs = text.split("\n")
     buffer = ""
@@ -22,12 +31,17 @@ def split_large_text(text, chunk_type="text"):
         if len(buffer) + len(para) < MAX_CHARS:
             buffer += para + "\n"
         else:
-            yield {
-                "chunk_type": chunk_type,
-                "text": buffer.strip(),
-                "structured_data": None,
-            }
-            buffer = para + "\n"
+            if buffer.strip():
+                yield {
+                    "chunk_type": chunk_type,
+                    "text": buffer.strip(),
+                    "structured_data": None,
+                }
+
+            # CHANGE: carry last OVERLAP_CHARS into next buffer
+            # Original was: buffer = para + "\n"  (hard reset, zero overlap)
+            overlap = buffer[-OVERLAP_CHARS:] if len(buffer) > OVERLAP_CHARS else buffer
+            buffer = overlap + para + "\n"
 
     if buffer.strip():
         yield {
@@ -77,14 +91,43 @@ def extract_text_stream(filename, file_bytes):
         try:
             doc = Document(io.BytesIO(file_bytes))
 
-            for para in doc.paragraphs:
-                if para.text.strip():
+            # CHANGE: group paragraphs in sliding windows of 3 with 1 overlap
+            # instead of yielding one paragraph at a time.
+            #
+            # Original:
+            #   for para in doc.paragraphs:
+            #       if para.text.strip():
+            #           yield { "text": para.text, ... }
+            #
+            # Problem: a single paragraph like "Reduce churn by 15%." has no
+            # surrounding context so it scores poorly in retrieval.
+            #
+            # Fix: combine 3 paragraphs per chunk, slide by 2 (1 overlap),
+            # so each chunk shares one paragraph with its neighbours.
+            paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+
+            WINDOW = 3
+            STEP = 2  # WINDOW - 1 overlap paragraph
+
+            i = 0
+            while i < len(paragraphs):
+                window = paragraphs[i: i + WINDOW]
+                combined = "\n".join(window)
+
+                if len(combined) > MAX_CHARS:
+                    # window too large — fall back to character splitter
+                    for chunk in split_large_text(combined, "text"):
+                        yield chunk
+                else:
                     yield {
                         "chunk_type": "text",
-                        "text": para.text,
+                        "text": combined,
                         "structured_data": None,
                     }
 
+                i += STEP
+
+            # Tables — unchanged from original
             for table_index, table in enumerate(doc.tables):
                 for row_index, row in enumerate(table.rows):
                     row_text = " | ".join(cell.text for cell in row.cells)
@@ -108,7 +151,6 @@ def extract_text_stream(filename, file_bytes):
             text = file_bytes.decode("utf-8")
             data = json.loads(text)
 
-            # If top-level is list → split per item
             if isinstance(data, list):
                 for idx, item in enumerate(data):
                     yield {
@@ -118,7 +160,6 @@ def extract_text_stream(filename, file_bytes):
                         "item_index": idx,
                     }
 
-            # If dict → split per key
             elif isinstance(data, dict):
                 for key, value in data.items():
                     yield {

@@ -2,9 +2,11 @@
 
 ## Role & Persona
 
-The Evaluator is the **"Quality Scorecard"** of MASIS. It is an implementation of the **LLM-as-a-Judge** pattern — an independent LLM that scores the quality of the final answer across four dimensions: Faithfulness, Relevance, Completeness, and Reasoning Quality. Unlike the Critic (which decides whether to retry), the Evaluator produces a permanent quality record that travels with the response for observability, monitoring, and continuous improvement.
+The Evaluator is the **"Quality Scorecard"** of MASIS. It is an implementation of the **LLM-as-a-Judge** pattern — an independent LLM that scores the final answer across four dimensions: Faithfulness, Relevance, Completeness, and Reasoning Quality.
 
-The Evaluator does not affect routing. It is a pure measurement agent.
+Unlike the Critic (which decides whether to retry), the Evaluator produces a **permanent quality record** that travels with the response for observability, monitoring, and continuous improvement. It does not affect routing.
+
+Crucially, the Evaluator receives the Critic's deterministic citation findings as hard constraints on its scoring — it cannot assign a high faithfulness score to an answer the citation engine already proved is hallucinated.
 
 ---
 
@@ -12,7 +14,7 @@ The Evaluator does not affect routing. It is a pure measurement agent.
 
 ### Problem 1: No Objective Quality Signal After the Conversation
 
-In production, knowing whether the system produced good answers is essential for monitoring, alerting, and model improvement. Without an automated quality signal, the only feedback is user complaints — which are rare, slow, and biased. You need automated evaluation running on every request.
+Without automated quality measurement, the only feedback is user complaints — rare, slow, and biased. You need a quality signal on every request.
 
 **How MASIS solves it — LLM-as-a-Judge with Structured Scores:**
 
@@ -22,17 +24,17 @@ class Evaluation(BaseModel):
     relevance: float           # question alignment (0–1)
     completeness: float        # coverage (0–1)
     reasoning_quality: float   # clarity & logic (0–1)
-    overall_score: float       # weighted average
+    overall_score: float       # weighted mean
     improvement_suggestions: list[str]
 ```
 
-The Evaluator produces a structured score record stored in `state["metrics"]["evaluation"]`. This record is returned in every API response and can be logged, monitored in dashboards, or aggregated for model performance analysis over time.
+Stored in `state["metrics"]["evaluation"]` and returned in every API response — both on success and on HITL. This means even low-confidence responses come with a quality breakdown explaining *why* confidence was insufficient.
 
 ---
 
-### Problem 2: Evaluator Cannot Score Relevance Without Knowing the Question
+### Problem 2: Evaluator Cannot Score Relevance Without the Question
 
-This was a real bug in the original implementation. The prompt sent to the evaluator included the answer and the evidence, but **not the user's question**. The evaluator was asked to score "Relevance: Does this fully answer the user question?" — but it couldn't see what the question was.
+An early bug: the evaluation prompt included the answer and evidence but **not the user's question**. The evaluator was asked "Does this fully answer the user question?" without knowing what the question was.
 
 **How MASIS solves it — User Query Explicitly in the Evaluation Prompt:**
 
@@ -41,12 +43,6 @@ prompt = f"""
 ...
 Relevance:
 1 = fully answers user question
-0.5 = partially relevant
-0 = irrelevant
-
-Completeness:
-1 = covers all aspects of the question
-...
 
 Question:
 {query}
@@ -59,17 +55,17 @@ Evidence:
 """
 ```
 
-The question is now the first piece of content the evaluator sees (after the rubric), followed by the answer, followed by the evidence. This ordering mirrors how a human evaluator would approach the task: first understand what was asked, then read the answer, then check it against the evidence.
+The question appears first in the content — before the answer — mirroring how a human evaluator approaches the task: understand what was asked, read the answer, check it against the evidence.
 
 ---
 
-### Problem 3: LLMs Tend to Score Generously (Mode Collapse to High Scores)
+### Problem 3: LLMs Score Generously (Mode Collapse to High Scores)
 
-Without explicit instruction, LLMs rate things highly — they are trained to be helpful and agreeable. A lenient evaluator provides no useful signal because everything scores 0.9+.
+Without explicit instruction, LLMs rate things highly. A lenient evaluator provides no useful signal because everything scores 0.9+.
 
-**How MASIS solves it — Explicit Rubric with Anchors and a Strictness Instruction:**
+**How MASIS solves it — Explicit Rubric with Anchors and Strictness Instruction:**
 
-Each dimension has three explicit anchor points (0, 0.5, 1) with concrete definitions, not just "low/medium/high":
+Each dimension has three explicit anchor points:
 
 ```
 Faithfulness:
@@ -78,21 +74,75 @@ Faithfulness:
 0 = unsupported
 ```
 
-And a hard instruction at the top:
-
-```
-Be strict. Do NOT default to 1.
-```
-
-The combination of rubric anchors and an explicit anti-leniency instruction produces more calibrated, discriminating scores than leaving it to the model's judgment.
+Plus a hard instruction: `"Be strict. Do NOT default to 1."` and `"Use the citation audit findings to calibrate Faithfulness accurately."`
 
 ---
 
-### Problem 4: Scores Returned in the Wrong Scale
+### Problem 4: Evaluator Can Contradict the Citation Engine
 
-The same issue exists here as in the Critic — some LLMs return confidence on a 0–100 scale rather than 0–1, despite prompt instructions.
+The LLM evaluator has no direct knowledge of the citation engine's deterministic findings. It could assign faithfulness = 0.9 to an answer the citation engine already proved contains fabricated chunk IDs.
 
-**How MASIS solves it — Score Normalization Across All Metrics:**
+**How MASIS solves it — Citation Audit Injection as Hard Constraints:**
+
+```python
+citation_audit = state.get("metrics", {}).get("last_citation_audit", {})
+invalid_citations = citation_audit.get("invalid_citations", [])
+uncited_count = citation_audit.get("uncited_claim_count", 0)
+hallucination_detected = citation_audit.get("hallucination_detected", False)
+
+citation_context = f"""
+=== Citation Audit Results (from Critic) ===
+- Invalid citation IDs found: {invalid_citations if invalid_citations else "None"}
+- Sentences with NO citation: {uncited_count}
+- Hallucination detected: {hallucination_detected}
+
+IMPORTANT scoring rules:
+- If uncited sentences >= 5, Faithfulness MUST be <= 0.5
+- If uncited sentences >= 10, Faithfulness MUST be <= 0.3
+- If hallucination_detected is True, Faithfulness MUST be <= 0.4
+- If invalid citations exist, Faithfulness MUST be <= 0.4
+- These are hard constraints — do not override them.
+"""
+```
+
+The Critic stores its findings in `state["metrics"]["last_citation_audit"]`. The Evaluator reads them and receives them as explicit scoring constraints in the prompt.
+
+---
+
+### Problem 5: LLM Ignores the Constraints Anyway
+
+Even with explicit instructions, LLMs sometimes override them. The Evaluator's prompt says faithfulness must be ≤ 0.4 when hallucination is detected — but the LLM might still return 0.7.
+
+**How MASIS solves it — Post-Response Hard Clamps:**
+
+```python
+if hallucination_detected or invalid_citations:
+    evaluation["faithfulness"] = min(evaluation["faithfulness"], 0.4)
+
+if uncited_count >= 10:
+    evaluation["faithfulness"] = min(evaluation["faithfulness"], 0.3)
+elif uncited_count >= 5:
+    evaluation["faithfulness"] = min(evaluation["faithfulness"], 0.5)
+
+# Recalculate overall_score as weighted mean after clamping
+evaluation["overall_score"] = round(
+    evaluation["faithfulness"] * 0.35 +
+    evaluation["relevance"] * 0.25 +
+    evaluation["completeness"] * 0.25 +
+    evaluation["reasoning_quality"] * 0.15,
+    3
+)
+```
+
+After the LLM responds, faithfulness is clamped by code regardless of what the LLM returned. The overall score is then recalculated as a weighted mean with faithfulness weighted highest (35%) — reflecting that a hallucinated answer, however well-written, is fundamentally untrustworthy. This guarantees the deterministic citation engine's findings are always reflected in the final evaluation.
+
+---
+
+### Problem 6: Scale Mismatch
+
+Some LLMs return scores on a 0–100 scale instead of 0–1.
+
+**How MASIS solves it:**
 
 ```python
 for k in ["faithfulness", "relevance", "completeness", "reasoning_quality", "overall_score"]:
@@ -100,49 +150,34 @@ for k in ["faithfulness", "relevance", "completeness", "reasoning_quality", "ove
         evaluation[k] = evaluation[k] / 100.0
 ```
 
-All five numeric fields are checked and normalized. This handles both scale conventions gracefully.
-
----
-
-### Problem 5: Improvement Suggestions Are Actionable, Not Just Descriptive
-
-The `improvement_suggestions` field is not cosmetic. It's a list of strings the LLM generates explaining how the answer could be improved. In a production system, these can be:
-
-- Displayed to the user alongside the answer ("This answer may have gaps in X")
-- Logged and aggregated to identify systematic weaknesses ("We keep missing Y type of question")
-- Fed back into prompt engineering cycles to improve the Synthesizer's prompt
-
-This is the bridge between per-request quality and long-term system improvement.
+Applied before the hard clamps, so clamping always operates on a 0–1 scale.
 
 ---
 
 ## The Four Evaluation Dimensions
 
-| Dimension | What It Measures | Key Question |
+| Dimension | What It Measures | Weight in Overall Score |
 |---|---|---|
-| **Faithfulness** | Is every claim grounded in the retrieved evidence? | Are there hallucinations or unsupported inferences? |
-| **Relevance** | Does the answer actually address what was asked? | Did the system answer the right question? |
-| **Completeness** | Are all aspects of the question covered? | Did the system miss important sub-questions? |
-| **Reasoning Quality** | Is the answer well-structured and logically sound? | Is the answer clear, coherent, and well-reasoned? |
+| **Faithfulness** | Is every claim grounded in retrieved evidence? | 35% |
+| **Relevance** | Does the answer address what was asked? | 25% |
+| **Completeness** | Are all aspects of the question covered? | 25% |
+| **Reasoning Quality** | Is the answer well-structured and logically sound? | 15% |
 
-These map directly to the case study's three core metrics (Faithfulness, Relevance, Completeness) with Reasoning Quality added as a fourth dimension for structural quality.
+Faithfulness is weighted highest because a hallucinated answer, however complete and relevant, is dangerous in a strategic intelligence context.
 
 ---
 
-## Relationship Between Critic and Evaluator
-
-These two agents serve distinct purposes and should not be confused:
+## Critic vs. Evaluator — Key Distinction
 
 | | Critic | Evaluator |
 |---|---|---|
 | **Purpose** | Decides whether to retry | Measures permanent quality |
 | **Affects routing** | Yes | No |
-| **Runs per iteration** | Every cycle | Once (after Critic, before Supervisor return) |
-| **Output used by** | Supervisor | API response / monitoring |
-| **Model** | `gpt-4o` | `gpt-4o` |
-| **Output type** | Structured `Critique` | Structured `Evaluation` |
+| **Runs per iteration** | Every cycle | Once, after last Critic pass |
+| **Output consumed by** | Supervisor + Researcher (on retry) | API response + monitoring |
+| **Citation findings flow** | Produces `last_citation_audit` | Consumes `last_citation_audit` |
 
-The Critic is an operational control — it gates progression. The Evaluator is a measurement instrument — it records outcomes.
+The Critic is an operational control gate. The Evaluator is a measurement instrument. They are in a producer-consumer relationship via `last_citation_audit`.
 
 ---
 
@@ -150,12 +185,13 @@ The Critic is an operational control — it gates progression. The Evaluator is 
 
 | Field | Direction | Description |
 |---|---|---|
-| `user_query` | Input | The original question (needed for relevance scoring) |
-| `final_answer` | Input | The audited draft answer |
-| `evidence` | Input | Evidence chunks (for faithfulness scoring) |
-| `metrics.evaluation` | **Output** | Full evaluation dict with all scores |
+| `user_query` | Input | Needed for relevance scoring |
+| `final_answer` | Input | The audited draft |
+| `evidence` | Input | For faithfulness scoring |
+| `metrics.last_citation_audit` | Input | Critic's deterministic findings |
+| `metrics.evaluation` | **Output** | Full evaluation with all scores |
 | `metrics.node_latency_ms.evaluator` | **Output** | Time taken |
-| `trace` | **Output** | Appended evaluation summary |
+| `trace` | **Output** | Evaluation summary entry |
 
 ---
 
@@ -164,20 +200,12 @@ The Critic is an operational control — it gates progression. The Evaluator is 
 ```json
 {
   "node": "evaluator",
-  "overall_score": 0.84,
-  "faithfulness": 0.92,
+  "overall_score": 0.71,
+  "faithfulness": 0.40,
   "relevance": 0.88,
   "completeness": 0.72,
   "duration_ms": 987
 }
 ```
 
----
-
-## Model Choice Rationale
-
-The Evaluator uses **`gpt-4o`** (same as the Critic). Justification:
-
-- Evaluation requires sophisticated reading comprehension — understanding whether claims are truly grounded requires the same reasoning depth as detecting hallucinations.
-- Using `gpt-4o-mini` here would produce noisier, less calibrated scores, defeating the purpose of the measurement.
-- The cost is justified: evaluation runs once per request (not once per retry), and the quality of its scores directly affects the reliability of your entire monitoring infrastructure.
+A faithfulness of 0.40 here would indicate the hard clamp fired — the LLM may have returned a higher score but the citation engine found hallucinations and the code overrode it.

@@ -12,7 +12,7 @@ This separation of concerns is deliberate — by keeping retrieval and generatio
 
 ### Problem 1: Retrieval Without Context of Past Failures
 
-On a naive first pass, a system would embed the user's query and retrieve the top-K closest chunks — no more thought given to it. But what if those chunks were insufficient? What if the answer built on them had hallucinations or logical gaps? The system would retry with the **exact same query**, pulling the **exact same chunks**, and fail again.
+On a naive first pass, a system embeds the user's query and retrieves the top-K closest chunks. But what if those chunks were insufficient? The system would retry with the **exact same query**, pulling the **exact same chunks**, and fail again.
 
 **How MASIS solves it — Critique-Aware Query Augmentation:**
 
@@ -26,98 +26,119 @@ if retry_count > 0 and critique:
         augmented_query += " " + " ".join(str(t) for t in focus_terms)
 ```
 
-On every retry, the Critic's output from the previous iteration is read. The specific claims that were **unsupported** and the **logical gaps** identified are extracted and appended to the original query before embedding. This means the new embedding vector is semantically shifted toward the missing evidence, increasing the probability of surfacing chunks that fill those exact gaps.
+On every retry the Critic's unsupported claims and logical gaps are appended to the original query before re-embedding. The new vector shifts toward missing evidence.
 
 **Example:**
-- Original query: `"What is the company's AI strategy?"`
-- Critic flagged: unsupported_claims = `["no mention of compute budget", "missing timeline"]`
-- Augmented query: `"What is the company's AI strategy? no mention of compute budget missing timeline"`
-- Result: Qdrant now returns chunks about compute spend and roadmap timelines that the first pass missed.
+- Original: `"What is the company's AI strategy?"`
+- Critic flagged: `["no mention of compute budget", "missing timeline"]`
+- Augmented: `"What is the company's AI strategy? no mention of compute budget missing timeline"`
+- Qdrant now surfaces chunks about compute spend and roadmap timelines that the first pass missed.
 
 ---
 
-### Problem 2: Fixed Retrieval Limits Regardless of Complexity
+### Problem 2: Weak Evidence Poisoning the Synthesizer
 
-Fetching 5 chunks for a simple query is fine. But if that answer was poor and the system is retrying, 5 chunks is likely not enough — there's clearly insufficient coverage.
+Without a quality filter, Qdrant returns the top-K results regardless of their actual relevance score. A vague query like *"findings of NovaTech"* returns chunks scoring 0.51, 0.48, 0.53 — all weakly matched. The Synthesizer builds a vague answer, the Critic penalises it, confidence tanks, and HITL triggers — for a query the documents could have answered with tighter retrieval.
+
+**How MASIS solves it — Minimum Score Threshold:**
+
+```python
+MIN_SCORE_THRESHOLD = 0.60
+
+threshold = MIN_SCORE_THRESHOLD if retry_count == 0 else MIN_SCORE_THRESHOLD - 0.05
+
+if r.score < threshold:
+    filtered_out += 1
+    continue
+```
+
+Each chunk is checked against a minimum cosine similarity of **0.60**. Chunks below this are discarded before reaching the Synthesizer. On retry the threshold drops to **0.55** because the augmented query is more specific — slightly weaker-scoring chunks may still be genuinely relevant to the augmented terms.
+
+`filtered_out` tracks how many chunks were dropped and appears in the trace so you can see exactly how aggressive the filter was on each pass.
+
+---
+
+### Problem 3: Fixed Retrieval Limits Regardless of Complexity
+
+With the score filter now potentially removing candidates, the pipeline needs more raw candidates to ensure enough qualify.
 
 **How MASIS solves it — Dynamic Limit Expansion:**
 
 ```python
-limit = 5 if retry_count == 0 else 10
+limit = 10 if retry_count == 0 else 20
 ```
 
-Simple but effective. On first pass: 5 chunks (fast, low cost). On any retry: 10 chunks (broader surface area). This balances speed on the happy path with thoroughness when needed.
+First pass: 10 candidates fetched from Qdrant. On retry: 20. The score filter narrows these down to only high-quality matches. This balances speed on the happy path with broader coverage when the first pass was insufficient.
+
+> The original implementation fetched 5/10. Doubled to ensure the score filter has sufficient candidates to work with.
 
 ---
 
-### Problem 3: Cross-Workspace Data Leakage
+### Problem 4: Cross-Workspace Data Leakage
 
-In a multi-tenant SaaS environment, multiple organizations share the same Qdrant collection (`masis_documents`). Without filtering, a query from Company A could retrieve chunks uploaded by Company B — a serious data privacy violation.
+In a multi-tenant environment, multiple organisations share the same Qdrant collection. Without filtering, Company A's query could return Company B's documents.
 
 **How MASIS solves it — Workspace-Scoped Filtering:**
 
 ```python
-results = qdrant_client.search(
-    collection_name="masis_documents",
-    query_vector=query_vector,
-    limit=limit,
-    query_filter=Filter(
-        must=[
-            FieldCondition(
-                key="workspace_id",
-                match=MatchValue(value=workspace_id)
-            )
-        ]
-    )
+query_filter=Filter(
+    must=[
+        FieldCondition(
+            key="workspace_id",
+            match=MatchValue(value=workspace_id)
+        )
+    ]
 )
 ```
 
-Every search is hard-filtered to `workspace_id`. This is a **metadata filter** applied at the Qdrant layer — not post-processing. Only chunks tagged with the correct workspace are ever returned, regardless of semantic similarity to other tenants' data.
+Applied at the Qdrant layer — not post-processing. Only chunks tagged with the correct `workspace_id` are ever returned, regardless of semantic similarity to other tenants' data.
 
 ---
 
-### Problem 4: Duplicate Chunks in Results
+### Problem 5: Duplicate Chunks in Results
 
-Qdrant can occasionally return the same chunk ID twice (e.g. if a document was indexed multiple times, or due to approximate nearest-neighbour overlap in certain configurations).
+Qdrant can occasionally return the same chunk ID twice due to approximate nearest-neighbour overlap.
 
 **How MASIS solves it — Deduplication by ID:**
 
 ```python
 seen_ids = set()
 for r in results:
-    if str(r.id) not in seen_ids:
-        seen_ids.add(str(r.id))
-        evidence.append(...)
+    if str(r.id) in seen_ids:
+        continue
+    seen_ids.add(str(r.id))
+    # score threshold check, then append
 ```
 
-A `seen_ids` set tracks chunk IDs already added. Duplicates are silently skipped. This prevents the same text appearing twice in the context window, which could artificially inflate confidence scores or produce repeated citations.
+Duplicates are caught before the score threshold check, preventing the same text appearing twice in the context window.
 
 ---
 
-### Problem 5: Zero Results Causing Infinite Loops
+### Problem 6: Zero Results Causing Wasted LLM Calls
 
-If no chunks are returned (empty collection, wrong workspace_id, or query too specific), the pipeline would previously proceed to the Synthesizer with empty evidence. The Synthesizer would produce an answer with no citations. The Critic would flag everything as a hallucination. The Supervisor would trigger a retry. The Researcher would again return zero results. This would loop until `max_retries` was exhausted — wasting API calls and time.
+If no chunks survive the score filter, the pipeline would proceed to the Synthesizer with empty evidence — producing an uncited answer the Critic would flag, triggering pointless retries.
 
-**How MASIS solves it — Immediate HITL Escalation on Zero Results:**
+**How MASIS solves it — Immediate HITL with Contextual Message:**
 
 ```python
 if not evidence:
-    state["requires_human_review"] = True
-    state["clarification_question"] = (
+    clarification = (
+        "Your query did not match any documents with sufficient relevance. "
+        "Try rephrasing with more specific terms from your documents, "
+        "or upload documents that cover this topic."
+    ) if filtered_out > 0 else (
         "No relevant documents were found for your query in this workspace. "
         "Please upload relevant documents or refine your question."
     )
-    state["trace"].append({
-        "node": "researcher",
-        "retry_count": retry_count,
-        "warning": "zero_results_retrieved",
-        "duration_ms": duration
-    })
-    state["evidence"] = []
-    return state
+    state["requires_human_review"] = True
+    state["clarification_question"] = clarification
 ```
 
-Zero results is detected immediately. Instead of proceeding, the system sets `requires_human_review = True` and writes a clear `clarification_question` explaining what the user should do. The graph's routing logic then reads `requires_human_review` and exits to `END`, surfacing the message to the user. No further LLM calls are made.
+Two distinct messages:
+- **All filtered out** (`filtered_out > 0`): candidates existed but none were relevant enough → rephrase.
+- **Zero from Qdrant**: workspace empty or query completely off-topic → upload documents.
+
+The graph's router reads `requires_human_review` and exits immediately to END. No further LLM calls are made.
 
 ---
 
@@ -125,37 +146,63 @@ Zero results is detected immediately. Instead of proceeding, the system sets `re
 
 | Field | Direction | Description |
 |---|---|---|
-| `user_query` | Input | The original question from the user |
-| `workspace_id` | Input | Tenant scoping key for Qdrant filter |
-| `retry_count` | Input | Determines query augmentation and limit |
-| `critique` | Input | Unsupported claims / gaps from previous Critic run |
-| `evidence` | **Output** | List of `EvidenceChunk` objects |
-| `requires_human_review` | **Output** | Set to `True` if zero results found |
-| `clarification_question` | **Output** | Human-readable explanation if HITL triggered |
+| `user_query` | Input | Original question |
+| `workspace_id` | Input | Tenant scoping key |
+| `retry_count` | Input | Determines augmentation, limit, and threshold |
+| `critique` | Input | Previous Critic output (unsupported claims / gaps) |
+| `evidence` | **Output** | Score-filtered `EvidenceChunk` list |
+| `requires_human_review` | **Output** | `True` if no qualifying evidence |
+| `clarification_question` | **Output** | Contextual HITL message |
 | `metrics` | **Output** | `retrieval_scores`, `avg_retrieval_score`, `node_latency_ms` |
-| `trace` | **Output** | Appended entry with retrieval stats |
+| `trace` | **Output** | Retrieval stats including `filtered_out`, `threshold_used` |
 
 ---
 
 ## Telemetry Emitted
 
+**Happy path:**
 ```json
 {
   "node": "researcher",
-  "retry_count": 1,
-  "chunks": 10,
-  "avg_score": 0.847,
-  "augmented_query_used": true,
+  "retry_count": 0,
+  "chunks": 7,
+  "filtered_out": 3,
+  "avg_score": 0.724,
+  "threshold_used": 0.60,
+  "augmented_query_used": false,
   "duration_ms": 312
 }
 ```
 
-This trace entry is appended to `state["trace"]` and is part of the full auditable trail available in the final API response.
+**Retry pass:**
+```json
+{
+  "node": "researcher",
+  "retry_count": 1,
+  "chunks": 12,
+  "filtered_out": 8,
+  "avg_score": 0.681,
+  "threshold_used": 0.55,
+  "augmented_query_used": true,
+  "duration_ms": 418
+}
+```
+
+**All filtered / zero results:**
+```json
+{
+  "node": "researcher",
+  "warning": "no_qualifying_evidence",
+  "results_before_filter": 10,
+  "threshold_used": 0.60,
+  "duration_ms": 289
+}
+```
 
 ---
 
 ## What the Researcher Does NOT Do
 
-- It does **not** generate, summarize, or interpret any content.
-- It does **not** decide whether retrieved evidence is sufficient (that's the Critic's job).
-- It does **not** perform keyword or hybrid search — currently semantic only. This is a known limitation worth raising in design discussions (see interview questions doc).
+- Does **not** generate, summarize, or interpret content.
+- Does **not** decide whether evidence is sufficient — that is the Critic's job.
+- Does **not** perform keyword or hybrid search — currently semantic only. Known limitation: keyword search catches exact-match terms (product names, dates, codes) that semantic search misses. BM25 sparse vectors with Reciprocal Rank Fusion would be the production improvement.
